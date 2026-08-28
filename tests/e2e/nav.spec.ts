@@ -26,12 +26,24 @@
  * of its own, which `tests/unit/db-boundary.test.ts` forbids and which would
  * run with `foreign_keys` OFF.
  *
- * ── Why the last two criteria are guarded ─────────────────────────────────
- * `/article/[slug]` and `/@[handle]` belong to TASK-009 and TASK-010 and do
- * not exist yet. The Skeleton criterion names all three routes, so it is
- * stated in full and arms itself route by route as those slices land — the
- * assertions are real and pre-wired, not stubbed. `/` exists today, so the
- * part that can run, runs.
+ * ── Why the last criterion is still guarded ───────────────────────────────
+ * The Skeleton criterion names `/`, `/article/[slug]` and `/@[handle]`. The
+ * first two exist now (TASK-007, TASK-009); `/@[handle]` belongs to TASK-010
+ * and does not, so the criterion is stated in full and arms itself route by
+ * route as that slice lands — the assertions are real and pre-wired, not
+ * stubbed.
+ *
+ * ── Where the loading boundaries live, and why it is not one file ─────────
+ * TASK-009 deleted the root `app/loading.tsx` (DEC-047): a `loading.tsx` at
+ * the app root wraps every page in a Suspense boundary whose fallback flushes
+ * before any page resolves, which commits HTTP 200 and makes `notFound()`
+ * structurally unable to answer 404 anywhere in the product. TASK-018 put the
+ * skeletons back one segment at a time — `app/search/loading.tsx`,
+ * `app/tag/[slug]/loading.tsx`, `app/bookmarks/loading.tsx`, and for `/`, a
+ * `<Suspense>` inside `app/page.tsx`, because `/`'s loading file would be the
+ * root one. SPEC-011:44 asks for a loading file "per route group", so this is
+ * closer to the spec text than the single file was. Both halves of that
+ * arrangement — skeleton present, 404 still hard — are asserted below.
  */
 
 import { expect, test, type Page } from '@playwright/test';
@@ -455,6 +467,96 @@ test.describe('SPEC-011 — navigation never shows a blank frame', () => {
       },
     },
   ];
+
+  /**
+   * The four list surfaces that carry a loading boundary, and how each one
+   * gets it (TASK-018, DEC-047).
+   *
+   * Three of them are ordinary segment-level `loading.tsx` files. `/` cannot
+   * be: its loading file IS `app/loading.tsx`, and a file at that path wraps
+   * EVERY page in a Suspense boundary whose fallback flushes — and therefore
+   * commits HTTP 200 — before any page below has resolved, which is precisely
+   * what made `notFound()` unable to answer 404 anywhere in the product. So
+   * `/` declares its own `<Suspense>` inside `app/page.tsx`, around the part
+   * of the page that waits. Same markup, same testid, one route of scope
+   * instead of all of them.
+   *
+   * `/bookmarks` is deliberately absent from this list: it redirects an
+   * anonymous visitor to `/signin`, so a raw request never reaches its
+   * fallback. It is covered by the visibility test below instead.
+   */
+  const SKELETON_SURFACES = [
+    {
+      name: '/',
+      how: 'a <Suspense> inside app/page.tsx',
+      resolve: async () => '/',
+    },
+    {
+      name: '/search',
+      how: 'app/search/loading.tsx',
+      resolve: async () => '/search?q=the',
+    },
+    {
+      name: '/tag/[slug]',
+      how: 'app/tag/[slug]/loading.tsx',
+      resolve: async () => {
+        // Ordered by id so the same row is chosen on every run, per SPEC-002.
+        const tag = await getDb().tag.findFirst({
+          select: { slug: true },
+          orderBy: { id: 'asc' },
+        });
+        return tag ? `/tag/${tag.slug}` : null;
+      },
+    },
+  ];
+
+  for (const surface of SKELETON_SURFACES) {
+    test(`${surface.name} flushes the skeleton before its content`, async ({ page }) => {
+      const path = await surface.resolve();
+      test.skip(path === null, `skipped: the seed corpus holds no row to build ${surface.name}`);
+
+      // Asserted against the RESPONSE BODY rather than against the rendered
+      // page, because that is the only form of this criterion that is not a
+      // race. "Was the skeleton visible?" depends on whether the machine
+      // running the test is fast enough to lose to it; "was the skeleton in
+      // the bytes the server sent first?" is a property of the boundary
+      // itself. The fallback appearing in the streamed HTML *is* the proof
+      // that the reader's first frame was not blank — SPEC-011's actual claim.
+      const response = await page.request.get(path as string);
+      expect(response.status(), `${surface.name} should answer 200`).toBe(200);
+
+      const html = await response.text();
+      expect(
+        html,
+        `${surface.name} lost its loading boundary (${surface.how}) — SPEC-011 requires a Skeleton, not a blank frame`,
+      ).toContain('data-testid="route-loading"');
+    });
+  }
+
+  test('the restored skeletons did not bring back the soft 404', async ({ page }) => {
+    // The coupling this whole task turns on, asserted in one place so it
+    // cannot be half-true. TASK-009 removed the root `app/loading.tsx` because
+    // it made every `notFound()` in the product render into an already-open
+    // 200 (measured single-variable, fresh dev server: present -> 200,
+    // absent -> 404). TASK-018 put the skeletons back per segment. If anyone
+    // ever "simplifies" those three boundaries back up to one root file, the
+    // skeleton assertions above would still pass and this one would fail —
+    // which is the only reason it is worth writing separately.
+    const home = await page.request.get('/');
+    expect(home.status()).toBe(200);
+    expect(await home.text()).toContain('data-testid="route-loading"');
+
+    // A slug that cannot exist: SPEC-004 slugs end in `-<6 chars of id>`, and
+    // nothing seeds this one. A hard 404 is the sealed TASK-009 criterion and
+    // the thing SPEC-005's draft-privacy assertions rest on.
+    const unknown = await page.request.get('/article/task-018-no-such-article', {
+      failOnStatusCode: false,
+    });
+    expect(
+      unknown.status(),
+      'an unknown article slug must be a HARD 404 — a loading boundary above /article/[slug] would make it 200',
+    ).toBe(404);
+  });
 
   test('the route loading fallback renders the Skeleton primitive, not a blank frame', async ({
     page,

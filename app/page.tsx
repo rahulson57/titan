@@ -26,6 +26,34 @@
  * be exactly full, and lead to the empty state. The alternative is a second
  * `COUNT(*)` over a set that only grows, to learn one bit.
  *
+ * ── The loading boundary lives INSIDE this file (TASK-018, DEC-047) ───────
+ * SPEC-011 requires that "no route shows a blank white frame for more than
+ * 200 ms after navigation", and everywhere else in the product that is a
+ * segment-level `loading.tsx`. `/` cannot have one: its loading file IS
+ * `app/loading.tsx`, and a `loading.tsx` at the app ROOT wraps every page in
+ * the product in a Suspense boundary whose fallback flushes before any page
+ * below it has resolved. The HTTP status is committed with that first chunk,
+ * so `notFound()` anywhere below can only render into an already-open 200 —
+ * measured single-variable on a fresh dev server: root file present -> 200 for
+ * an unknown article slug, absent -> 404. Restoring that file to give `/` a
+ * skeleton would re-break the sealed hard-404 criterion for `/article/[slug]`
+ * and both of SPEC-005's draft-privacy assertions.
+ *
+ * So the boundary is declared here instead, around the part of the page that
+ * actually waits. It covers exactly one route — this one, which never calls
+ * `notFound()` — and covers nothing nested, so there is no status anywhere
+ * that it can pre-empt. That is the whole difference between this and the file
+ * that was deleted: scope, not markup.
+ *
+ * ── Why the split into `FeedSection` is load-bearing ──────────────────────
+ * A `<Suspense>` only shows its fallback if something INSIDE it suspends.
+ * Wrapping `<FeedList>` while the page component itself awaited `auth()` and
+ * the feed query would render nothing until those had already resolved — the
+ * boundary would be decoration, and the first frame would still be blank. The
+ * awaits therefore moved down into `FeedSection`, leaving this component with
+ * only `await searchParams` (resolved from the parsed request, not I/O). The
+ * shell — heading and tabs — is emitted immediately; the rows stream in.
+ *
  * ── On styling ────────────────────────────────────────────────────────────
  * `app/globals.css` belongs to SPEC-003 (TASK-002) and is outside this task's
  * file scope, so the page frame reads design tokens through `style` props —
@@ -33,14 +61,21 @@
  * The cards themselves are the design system's `ArticleCard`, unchanged.
  */
 
-import type { CSSProperties } from 'react';
+import { Suspense, type CSSProperties } from 'react';
 import type { Metadata } from 'next';
 
 import { FeedList } from '../components/feed/FeedList';
 import { FeedTabs, tabHref } from '../components/feed/FeedTabs';
 import { EmptyState } from '../components/ui/EmptyState';
+import { Skeleton } from '../components/ui/Skeleton';
 import { auth } from '../lib/auth/session';
-import { getFeedPage, getFollowingPage, parseFeedTab, type FeedItem } from '../lib/feed/queries';
+import {
+  getFeedPage,
+  getFollowingPage,
+  parseFeedTab,
+  type FeedItem,
+  type FeedTab,
+} from '../lib/feed/queries';
 import { FEED_PAGE_SIZE } from '../lib/feed/rank';
 import { NEW_STORY } from '../lib/routes';
 
@@ -81,11 +116,67 @@ const headingStyle: CSSProperties = {
   marginBlockEnd: 'var(--space-5)',
 };
 
-export default async function HomePage({ searchParams }: PageProps) {
-  const params = await searchParams;
-  const tab = parseFeedTab(first(params.tab));
-  const cursor = first(params.cursor) ?? null;
+const skeletonColumnStyle: CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 'var(--space-7)',
+};
 
+const skeletonRowStyle: CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  gap: 'var(--space-3)',
+};
+
+const skeletonBylineStyle: CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 'var(--space-2)',
+};
+
+/** Three rows: enough to fill the fold, few enough to stay cheap. */
+const PLACEHOLDER_ROWS = [0, 1, 2];
+
+/**
+ * The first frame of the feed.
+ *
+ * Same `Skeleton` primitive, same three-row article-card geometry and the same
+ * `route-loading` testid as `app/bookmarks/loading.tsx`, `app/search/loading.tsx`
+ * and `app/tag/[slug]/loading.tsx` — the identifier the sealed SPEC-011 oracle
+ * probes. It is declared here rather than shared from `components/ui/` because
+ * that directory is SPEC-003's and outside TASK-018's file scope; the
+ * duplication is called out in the proposal as a follow-up worth taking, not
+ * an oversight.
+ *
+ * Note what is NOT in here: the heading and the tabs. Those are real content,
+ * they need no data, and they render in the shell above this boundary — so the
+ * reader gets the page's identity and its navigation immediately, and only the
+ * rows are placeheld.
+ */
+function FeedSkeleton() {
+  return (
+    <div style={skeletonColumnStyle} data-testid="route-loading">
+      {PLACEHOLDER_ROWS.map((row) => (
+        <div key={row} style={skeletonRowStyle}>
+          <div style={skeletonBylineStyle}>
+            <Skeleton variant="circle" width={24} height={24} />
+            <Skeleton variant="text" width="9rem" />
+          </div>
+          {/* Headline-sized bar, then two lines of dek — the article-card shape. */}
+          <Skeleton variant="rect" width="80%" height={28} />
+          <Skeleton variant="text" lines={2} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Everything on `/` that has to wait for the database: the session read and
+ * the ranked page of rows. Kept as its own async component so the `<Suspense>`
+ * in `HomePage` has something that genuinely suspends — see the file header.
+ */
+async function FeedSection({ tab, cursor }: { tab: FeedTab; cursor: string | null }) {
   const session = await auth();
 
   // One extra row, never rendered. See the header.
@@ -103,6 +194,40 @@ export default async function HomePage({ searchParams }: PageProps) {
       : null;
 
   return (
+    <FeedList
+      items={items}
+      moreHref={moreHref}
+      testId="feed-list"
+      empty={
+        <EmptyState
+          // SPEC-008 fixes this string.
+          title="Nothing here yet"
+          description={
+            tab === 'following'
+              ? 'Stories from the people you follow will show up here.'
+              : 'Published stories will show up here.'
+          }
+          action={
+            // SPEC-008: the empty state links to `/editor/new`. The same
+            // link for both tabs, deliberately — the spec names one empty
+            // state for `/`, and an anonymous reader who follows it lands on
+            // the sign-in redirect the editor route already owns.
+            <a className="btn btn--primary" href={NEW_STORY} data-testid="feed-empty-write">
+              Write a story
+            </a>
+          }
+        />
+      }
+    />
+  );
+}
+
+export default async function HomePage({ searchParams }: PageProps) {
+  const params = await searchParams;
+  const tab = parseFeedTab(first(params.tab));
+  const cursor = first(params.cursor) ?? null;
+
+  return (
     <main style={columnStyle} data-testid="home-feed" data-tab={tab}>
       {/*
         The page's own H1. Visually hidden rather than absent: every page needs
@@ -116,31 +241,17 @@ export default async function HomePage({ searchParams }: PageProps) {
 
       <FeedTabs active={tab} />
 
-      <FeedList
-        items={items}
-        moreHref={moreHref}
-        testId="feed-list"
-        empty={
-          <EmptyState
-            // SPEC-008 fixes this string.
-            title="Nothing here yet"
-            description={
-              tab === 'following'
-                ? 'Stories from the people you follow will show up here.'
-                : 'Published stories will show up here.'
-            }
-            action={
-              // SPEC-008: the empty state links to `/editor/new`. The same
-              // link for both tabs, deliberately — the spec names one empty
-              // state for `/`, and an anonymous reader who follows it lands on
-              // the sign-in redirect the editor route already owns.
-              <a className="btn btn--primary" href={NEW_STORY} data-testid="feed-empty-write">
-                Write a story
-              </a>
-            }
-          />
-        }
-      />
+      {/*
+        `key` re-arms the boundary whenever the tab or the page changes. Without
+        it React keeps the resolved subtree mounted across a client-side
+        navigation to `?tab=following` or the next cursor, so the reader sits
+        looking at the PREVIOUS tab's stories with no indication that anything
+        is happening. With it, the same skeleton that covers the first load
+        covers every subsequent one.
+      */}
+      <Suspense key={`${tab}:${cursor ?? ''}`} fallback={<FeedSkeleton />}>
+        <FeedSection tab={tab} cursor={cursor} />
+      </Suspense>
     </main>
   );
 }
