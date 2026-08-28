@@ -27,18 +27,43 @@
  * sentinel file beside it. If a traversal ever did escape, it would land in the
  * wrapper -- so the census assertions can prove absence rather than just
  * asserting the happy path.
+ *
+ * -- Why the substring assertions are gone (TASK-027) ------------------------
+ * This file used to spell "the submitted name did not survive" as
+ * `expect(stored.path).not.toContain('etc')`. That is a coincidence, not a
+ * property: the stored name is 24 random symbols over `[a-z0-9]`, so a CORRECT
+ * server produces one containing `etc` about once in 2100 runs (22 positions x
+ * 36^-3), and the suite goes red having caught nothing. Worse than the noise --
+ * `npm test` is `vitest && playwright`, so a unit flake here short-circuits the
+ * entire e2e half and reads as a media-slice failure of whatever diff was being
+ * gated.
+ *
+ * The replacement is `expectTraversalSafe` below, which asserts what traversal
+ * actually means: (a) the served path is the shape SPEC-006 pins, (b) the
+ * stored name is a single segment with no separator and no dot-segment, (c) no
+ * dot-segment survives anywhere along the served path, and (d) -- the clause
+ * that decides whether a byte can land outside the tree -- the path RESOLVED
+ * against the uploads root is still under that root. No clause can be satisfied
+ * or broken by a lucky draw from the name generator.
+ *
+ * Every clause is proved capable of failing (DEC-015) in the last describe
+ * block: the same function is run against paths violating one clause each, and
+ * a file is dropped where an escape would land to show the on-disk census
+ * rejects it. An assertion never observed to reject anything is a comment.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join, relative, sep } from 'node:path';
+import { join, relative, resolve, sep } from 'node:path';
 import sharp from 'sharp';
 
 import { handleUpload } from '../../app/api/upload/route';
 import {
   MEDIA_ID_LENGTH,
+  PUBLIC_PREFIX,
+  STORED_EXTENSION,
   allocate,
   assertInside,
   assertSafeSegment,
@@ -55,6 +80,10 @@ const USER: SessionUser = {
 };
 
 const HOSTILE_NAME = '../../../etc/passwd.png';
+
+/** The two things a path segment must not contain if it is to mean one place. */
+const SEPARATOR = /[\\/]/;
+const DOT_SEGMENT = /(?:^|[\\/])\.{1,2}(?:[\\/]|$)/;
 
 let wrapper: string;
 let root: string;
@@ -86,6 +115,80 @@ function census(directory: string): string[] {
   return out.sort();
 }
 
+/**
+ * What the wrapper directory holds. A traversal that escaped `root` lands here,
+ * so this list IS the census assertion -- shared between the test that asserts
+ * it and the proof that the assertion can fail.
+ */
+function wrapperEntries(): string[] {
+  return readdirSync(wrapper).sort();
+}
+
+/** The served path, mapped back to the filesystem path it names. */
+function diskPathFor(publicPath: string): string {
+  const withinRoot = publicPath.startsWith(`${PUBLIC_PREFIX}/`)
+    ? publicPath.slice(PUBLIC_PREFIX.length + 1)
+    : publicPath;
+  // `resolve` collapses `..` exactly the way every downstream consumer does,
+  // which is the point: the question is where the path ENDS UP, not how it is
+  // spelled.
+  return resolve(root, withinRoot);
+}
+
+/**
+ * The traversal property, in one place.
+ *
+ * Run against every path this suite gets back from the route, and -- in the
+ * can-fail block below -- against paths that break exactly one clause each,
+ * which is what makes these clauses evidence rather than decoration.
+ */
+function expectTraversalSafe(publicPath: string, owner: string = USER.id): void {
+  // (a) The shape SPEC-006's oracle pins: kind directory, the uploader's own
+  //     directory, a generated name, `.webp`. The client's stem and the
+  //     client's extension are both structurally excluded -- nothing of the
+  //     submitted name can appear except by being drawn from the CSPRNG.
+  expect(publicPath).toMatch(
+    new RegExp(
+      `^${PUBLIC_PREFIX}/avatars/${owner}/[a-z0-9]{${MEDIA_ID_LENGTH}}\\${STORED_EXTENSION}$`,
+    ),
+  );
+
+  // (b) The stored name is ONE segment: no separator, no `.`/`..`, and a name
+  //     the generator itself recognises.
+  const name = publicPath.slice(publicPath.lastIndexOf('/') + 1);
+  expect(SEPARATOR.test(name), `separator in stored name: ${name}`).toBe(false);
+  expect(DOT_SEGMENT.test(name), `dot-segment in stored name: ${name}`).toBe(false);
+  expect(isMediaFilename(name), `not a generated name: ${name}`).toBe(true);
+
+  // (c) Nothing anywhere along the served path can climb: no `.` or `..`
+  //     segment is left for a later consumer to collapse.
+  expect(DOT_SEGMENT.test(publicPath), `dot-segment in served path: ${publicPath}`).toBe(false);
+
+  // (d) The clause that decides whether a byte can land outside the tree:
+  //     resolved against the uploads root, the path is still under the root.
+  //     This is the module's own last line of defence (`assertInside`), re-run
+  //     against the value the route handed back.
+  const absolute = diskPathFor(publicPath);
+  expect(() => assertInside(root, absolute), `escapes the root: ${absolute}`).not.toThrow();
+  expect(absolute.startsWith(root + sep), `outside the root: ${absolute}`).toBe(true);
+}
+
+/**
+ * Whether `expectTraversalSafe` REJECTS a path.
+ *
+ * `expect` throws on failure, so catching is how a test asserts that an
+ * assertion is capable of failing -- the proof DEC-015 asks for. Nothing else
+ * distinguishes a property that holds from one that cannot be violated.
+ */
+function violatesTraversalSafety(publicPath: string, owner?: string): boolean {
+  try {
+    expectTraversalSafe(publicPath, owner);
+    return false;
+  } catch {
+    return true;
+  }
+}
+
 async function tinyPng(): Promise<Buffer> {
   return sharp({
     create: { width: 32, height: 32, channels: 3, background: { r: 26, g: 137, b: 23 } },
@@ -110,28 +213,41 @@ describe('SPEC-006 - a hostile filename has nowhere to go', () => {
     stored = (await response.json()) as { path: string };
   });
 
-  it('stores under a server-generated name of the shape SPEC-006 pins', () => {
-    expect(stored.path).toMatch(
-      new RegExp(`^/uploads/avatars/${USER.id}/[a-z0-9]{${MEDIA_ID_LENGTH}}\\.webp$`),
-    );
+  it('stores under a server-generated name that resolves inside the uploads root', () => {
+    expectTraversalSafe(stored.path);
+    // ...and the file the served path names is really there, inside the root.
+    const absolute = diskPathFor(stored.path);
+    expect(existsSync(absolute), absolute).toBe(true);
+    expect(statSync(absolute).isFile(), absolute).toBe(true);
   });
 
-  it('keeps nothing of the submitted name - not the stem, not the extension', () => {
-    expect(stored.path).not.toContain('passwd');
-    expect(stored.path).not.toContain('etc');
-    expect(stored.path).not.toContain('..');
-    expect(stored.path.endsWith('.png')).toBe(false);
+  it('invents the name, so it cannot be a function of the submitted one', async () => {
+    // The old spelling of this test asked whether the stored path CONTAINED
+    // fragments of the hostile name, which a correct server fails by chance
+    // (see the header). The property underneath it is that the name does not
+    // depend on the input at all -- so submit the identical hostile filename
+    // repeatedly and require the results to differ. A server that derived the
+    // name from `file.name`, however carefully it sanitised, returns the same
+    // path every time.
+    const paths = new Set<string>([stored.path]);
+    for (let i = 0; i < 3; i++) {
+      const response = await handleUpload(upload(await tinyPng(), HOSTILE_NAME), USER);
+      expect(response.status).toBe(201);
+      const body = (await response.json()) as { path: string };
+      expectTraversalSafe(body.path);
+      paths.add(body.path);
+    }
+    expect(paths.size).toBe(4);
   });
 
   it('lands inside the uploading user own directory', () => {
-    expect(stored.path.startsWith(`/uploads/avatars/${USER.id}/`)).toBe(true);
+    expect(stored.path.startsWith(`${PUBLIC_PREFIX}/avatars/${USER.id}/`)).toBe(true);
   });
 
   it('writes no file outside the uploads root', () => {
     // The canary is still alone in the wrapper; everything else is under
     // `uploads/`.
-    const wrapperEntries = readdirSync(wrapper).sort();
-    expect(wrapperEntries).toEqual(['CANARY', 'uploads']);
+    expect(wrapperEntries()).toEqual(['CANARY', 'uploads']);
     for (const path of census(root)) expect(path.startsWith('uploads/')).toBe(true);
   });
 
@@ -149,11 +265,9 @@ describe('SPEC-006 - a hostile filename has nowhere to go', () => {
       const response = await handleUpload(upload(await tinyPng(), spelling), USER);
       expect(response.status, spelling).toBe(201);
       const body = (await response.json()) as { path: string };
-      expect(body.path, spelling).toMatch(
-        new RegExp(`^/uploads/avatars/${USER.id}/[a-z0-9]{${MEDIA_ID_LENGTH}}\\.webp$`),
-      );
+      expectTraversalSafe(body.path);
     }
-    expect(readdirSync(wrapper).sort()).toEqual(['CANARY', 'uploads']);
+    expect(wrapperEntries()).toEqual(['CANARY', 'uploads']);
   });
 
   it('an empty filename never arrives as a file at all, and answers 400', async () => {
@@ -165,7 +279,7 @@ describe('SPEC-006 - a hostile filename has nowhere to go', () => {
     const response = await handleUpload(upload(await tinyPng(), ''), USER);
     expect(response.status).toBe(400);
     expect(await response.json()).toMatchObject({ code: 'missing_file' });
-    expect(readdirSync(wrapper).sort()).toEqual(['CANARY', 'uploads']);
+    expect(wrapperEntries()).toEqual(['CANARY', 'uploads']);
   });
 });
 
@@ -174,7 +288,7 @@ describe('SPEC-006 - the name generator', () => {
     for (let i = 0; i < 200; i++) {
       const id = createMediaId();
       expect(id).toMatch(new RegExp(`^[a-z0-9]{${MEDIA_ID_LENGTH}}$`));
-      expect(isMediaFilename(`${id}.webp`)).toBe(true);
+      expect(isMediaFilename(`${id}${STORED_EXTENSION}`)).toBe(true);
     }
   });
 
@@ -196,8 +310,8 @@ describe('SPEC-006 - the name generator', () => {
 
   it('always ends in .webp, whatever came in', () => {
     const allocation = allocate('inline', USER.id, root);
-    expect(allocation.filename.endsWith('.webp')).toBe(true);
-    expect(allocation.publicPath.endsWith('.webp')).toBe(true);
+    expect(allocation.filename.endsWith(STORED_EXTENSION)).toBe(true);
+    expect(allocation.publicPath.endsWith(STORED_EXTENSION)).toBe(true);
   });
 });
 
@@ -255,5 +369,51 @@ describe('SPEC-006 - the one interpolated segment is checked anyway', () => {
     const before = readdirSync(root).sort();
     allocate('cover', 'someone-else-entirely', root);
     expect(readdirSync(root).sort()).toEqual(before);
+  });
+});
+
+describe('SPEC-006 - the traversal assertions are proved able to fail (DEC-015)', () => {
+  // A generated-shape name, so each mutant below differs from a legitimate
+  // path in exactly ONE respect: the clause it exists to violate.
+  const NAME = `${'a'.repeat(MEDIA_ID_LENGTH)}${STORED_EXTENSION}`;
+  const OWNED = `${PUBLIC_PREFIX}/avatars/${USER.id}`;
+
+  const MUTANTS: Array<[clause: string, path: string]> = [
+    ['(d) climbs out of the uploads root', `${OWNED}/../../../etc/passwd.png`],
+    ['(c) a dot-segment that still resolves inside', `${OWNED}/../${NAME}`],
+    ['(c) a single-dot segment', `${OWNED}/./${NAME}`],
+    ['(b) a separator smuggled into the stored name', `${OWNED}/nested/${NAME}`],
+    ['(b) a backslash climb in the stored name', `${OWNED}/..\\..\\${NAME}`],
+    ['(a) the client extension survived', `${OWNED}/${'a'.repeat(MEDIA_ID_LENGTH)}.png`],
+    ['(a) the client stem survived', `${OWNED}/passwd${STORED_EXTENSION}`],
+    ['(a) the generated name is the wrong length', `${OWNED}/${'a'.repeat(23)}${STORED_EXTENSION}`],
+    ['(a) another user directory', `${PUBLIC_PREFIX}/avatars/someone-else/${NAME}`],
+    ['(a) the wrong kind directory', `${PUBLIC_PREFIX}/inline/${USER.id}/${NAME}`],
+    ['(a) not under the uploads prefix at all', `/etc/passwd${STORED_EXTENSION}`],
+  ];
+
+  it('passes the positive control, so the rejections below are not accidents', () => {
+    expect(violatesTraversalSafety(`${OWNED}/${NAME}`)).toBe(false);
+  });
+
+  it.each(MUTANTS)('rejects %s', (_clause, path) => {
+    expect(violatesTraversalSafety(path), path).toBe(true);
+  });
+
+  it('the wrapper census notices a file that escaped the uploads root', async () => {
+    // The census assertions prove an absence, which is exactly the kind of
+    // assertion that keeps passing after it has stopped being able to fail.
+    // Put a file where an escape would land and watch the same expression
+    // reject it.
+    expect(wrapperEntries()).toEqual(['CANARY', 'uploads']);
+    const escapee = join(wrapper, 'ESCAPED.webp');
+    await writeFile(escapee, 'pretend a traversal succeeded\n');
+    try {
+      expect(wrapperEntries()).not.toEqual(['CANARY', 'uploads']);
+      expect(wrapperEntries()).toEqual(['CANARY', 'ESCAPED.webp', 'uploads']);
+    } finally {
+      await rm(escapee, { force: true });
+    }
+    expect(wrapperEntries()).toEqual(['CANARY', 'uploads']);
   });
 });
