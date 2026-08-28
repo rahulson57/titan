@@ -51,6 +51,9 @@ const PASSWORD = 'a quiet afternoon of reading';
 /** Fixed instant, so the fixture's order is a property of the fixture. */
 const EPOCH = new Date('2026-01-01T00:00:00.000Z');
 
+/** SPEC-010 fixes the profile list at 20; the fixture must exceed it to mean anything. */
+const PAGE_SIZE = 20;
+
 let seq = 0;
 function freshAccount(prefix: string) {
   const stamp = `${Date.now().toString(36)}${seq++}`;
@@ -110,11 +113,14 @@ test.describe.configure({ mode: 'serial' });
 test.describe('SPEC-010 — the public profile at /@handle', () => {
   const owner = freshAccount('pfown');
   const stranger = freshAccount('pfstr');
+  const pager = freshAccount('pfpag');
   let ownerId = '';
   let strangerId = '';
+  let pagerId = '';
   let publishedTitle = '';
   let draftTitle = '';
   let bookmarkedTitle = '';
+  const pagedTitles: string[] = [];
 
   test.beforeAll(async ({ browser }) => {
     // The owner signs up through the UI, so their session is a real one.
@@ -193,6 +199,43 @@ test.describe('SPEC-010 — the public profile at /@handle', () => {
     });
     await publishArticle(saved.id, EPOCH);
     await toggleBookmark(ownerId, saved.id, EPOCH);
+
+    // A separate author with one more article than a page holds, every one of
+    // them published at the SAME instant.
+    //
+    // Both halves matter. Twenty-one rows is what makes "page size 20" and the
+    // "Older stories" link mean anything — with three rows the second page is
+    // empty either way and the assertion passes against a page that never
+    // paginated. The identical timestamp is what makes the CURSOR mean
+    // anything: `publishedAt` is not unique, and a cursor over a non-total
+    // order silently repeats or drops rows. `listArticlesByAuthor` breaks the
+    // tie on `id`, and a fixture with distinct dates would never exercise it.
+    //
+    // This is deliberately not the owner's profile: adding twenty articles
+    // there would move the `1 story` count the header assertions read.
+    const pagerRow = await createUser({
+      email: pager.email,
+      passwordHash: await hashPassword(pager.password),
+      handle: pager.handle,
+      name: 'Prolific Author',
+      createdAt: EPOCH,
+    });
+    createdEmails.push(pager.email);
+    pagerId = pagerRow.id;
+
+    for (let index = 0; index < PAGE_SIZE + 1; index += 1) {
+      const title = `Paged story ${String(index).padStart(2, '0')} ${Date.now().toString(36)}`;
+      const article = await createArticle({
+        authorId: pagerId,
+        title,
+        bodyJson: body(`Story number ${index}, with a sentence of prose so the card has an excerpt.`),
+        bodyHtml: `<p>Story number ${index}.</p>`,
+        status: 'PUBLISHED',
+        now: EPOCH,
+      });
+      await publishArticle(article.id, EPOCH);
+      pagedTitles.push(title);
+    }
   });
 
   test.afterAll(async () => {
@@ -414,6 +457,47 @@ test.describe('SPEC-010 — the public profile at /@handle', () => {
     );
     await expect(page.getByRole('button', { name: /^follow(ing)?$/i })).toHaveCount(0);
     await expect(page.getByRole('link', { name: /^follow(ing)?$/i })).toHaveCount(0);
+
+    await context.close();
+  });
+
+  // -------------------------------------------------------------------------
+  // SPEC-010: "cursor-paginated, page size 20"
+  // -------------------------------------------------------------------------
+
+  test('pages at 20 and the cursor neither repeats nor drops a row', async ({ browser }) => {
+    // Not a sealed criterion, but the one place this slice can ship a defect
+    // that only appears in front of a user with enough writing: every article
+    // in this fixture shares one `publishedAt`, so the page order rests
+    // entirely on the `id` tiebreak. Without it a cursor over a non-total
+    // order repeats rows or steps over them, and a three-row fixture would
+    // never show it.
+    const context = await browser.newContext();
+    const page = await context.newPage();
+
+    await page.goto(`/@${pager.handle}`);
+    const firstPage = await page.getByTestId('profile-feed').locator('li').allInnerTexts();
+    expect(firstPage).toHaveLength(PAGE_SIZE);
+
+    // With exactly one row past the page there must be an "older" link — and
+    // with exactly 20 there must not be, which is the off-by-one the `take + 1`
+    // lookahead exists to answer.
+    const older = page.getByTestId('profile-more');
+    await expect(older).toBeVisible();
+
+    await older.click();
+    const secondPage = await page.getByTestId('profile-feed').locator('li').allInnerTexts();
+    expect(secondPage).toHaveLength(1);
+
+    // The union is every article and nothing twice. Asserted on the titles the
+    // fixture generated, so a page that silently showed some other author's
+    // rows would fail rather than count to 21.
+    const seen = [...firstPage, ...secondPage];
+    for (const title of pagedTitles) {
+      expect(seen.filter((text) => text.includes(title)), title).toHaveLength(1);
+    }
+    // And the last page offers no further link, rather than looping forever.
+    await expect(page.getByTestId('profile-more')).toHaveCount(0);
 
     await context.close();
   });
