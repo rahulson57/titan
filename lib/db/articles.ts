@@ -313,3 +313,138 @@ export async function countArticlesByAuthor(
 ): Promise<number> {
   return getDb().article.count({ where: { authorId, status } });
 }
+
+// ---------------------------------------------------------------------------
+// The author's own lists (SPEC-010's profile tabs)
+// ---------------------------------------------------------------------------
+
+/**
+ * One row of a profile tab.
+ *
+ * Deliberately NOT `ArticleRecord`. `bodyJson` and `bodyHtml` are the two
+ * largest columns in the schema, a page carries twenty rows, and no card
+ * renders a body — `bodyText` is here only because the excerpt is cut from it.
+ * `lib/db/social.ts` makes the same argument at greater length for
+ * `BookmarkedArticle`, and this shape is deliberately its sibling so the two
+ * profile tabs can be rendered by one component.
+ */
+export interface AuthoredArticle {
+  id: string;
+  slug: string;
+  title: string;
+  subtitle: string | null;
+  bodyText: string;
+  coverPath: string | null;
+  readingMinutes: number;
+  status: string;
+  publishedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+  tags: { slug: string; name: string }[];
+}
+
+export interface ListByAuthorOptions {
+  /** Which tab. Defaults to the public one. */
+  status?: ArticleStatus;
+  /** The `id` of the last row on the previous page. */
+  cursor?: string | null;
+  /** SPEC-010 fixes the page size at 20; callers may narrow it for tests. */
+  take?: number;
+}
+
+export interface AuthoredArticlePage {
+  items: AuthoredArticle[];
+  /** Pass as the next call's `cursor`. `null` when this is the last page. */
+  nextCursor: string | null;
+}
+
+/** SPEC-010: "cursor-paginated, page size 20". */
+export const PROFILE_PAGE_SIZE = 20;
+
+const AUTHORED_SELECT = {
+  id: true,
+  slug: true,
+  title: true,
+  subtitle: true,
+  bodyText: true,
+  coverPath: true,
+  readingMinutes: true,
+  status: true,
+  publishedAt: true,
+  createdAt: true,
+  updatedAt: true,
+  tags: { select: { tag: { select: { slug: true, name: true } } } },
+} as const;
+
+/**
+ * One author's articles in one status, newest first, cursor-paginated
+ * (SPEC-010).
+ *
+ * ── Why the sort key depends on the status ────────────────────────────────
+ * SPEC-010 says `publishedAt DESC`, and for the Published tab that is exactly
+ * what this does. A DRAFT has `publishedAt = null` by construction, so the
+ * same key would order the Drafts tab by nothing at all — SQLite would return
+ * whatever the scan produced, and the tab would appear to shuffle between
+ * page loads. Drafts therefore sort by `updatedAt DESC`, which is both a
+ * total-ish order and the one an author actually wants: the thing they were
+ * last working on is the thing they came back for.
+ *
+ * ── Why the sort is a PAIR of columns ─────────────────────────────────────
+ * Neither `publishedAt` nor `updatedAt` is unique. The 500-article seed corpus
+ * writes from a fixed clock precisely because SPEC-002 requires determinism,
+ * so ties are guaranteed there rather than merely possible. A cursor over a
+ * non-total order can repeat rows or skip them, and the defect only shows once
+ * the data has ties — which is to say in front of a user. `id` supplies the
+ * tiebreak, and it is unique, so the order is total.
+ *
+ * ── Why a cursor and not an offset ────────────────────────────────────────
+ * Same reason `listBookmarkedArticles` gives: an author publishing or deleting
+ * while paging shifts every later page under an offset, so `skip: 20` steps
+ * over a row nobody has seen. A cursor is anchored to a row and cannot slip.
+ *
+ * `take + 1` fetches one row past the page to answer "is there another page?"
+ * and then drops it — one bit, for free, instead of a second `COUNT(*)` over a
+ * set that only grows. `skip: 1` steps past the cursor row itself, which Prisma
+ * would otherwise include, repeating the previous page's last row on every page.
+ *
+ * ── This function does NOT decide who may see a draft ─────────────────────
+ * It answers "which of this author's articles are in this status", and nothing
+ * else. SPEC-010's rule that the Drafts tab is "hidden entirely from other
+ * viewers" is an authorization rule, and it is enforced by the page that
+ * chooses whether to call this with `DRAFT` — `lib/auth/session.ts` owns the
+ * predicate. A repository that also tried to enforce visibility would need a
+ * viewer parameter, and the two checks would then disagree the first time one
+ * of them was updated.
+ */
+export async function listArticlesByAuthor(
+  authorId: string,
+  options: ListByAuthorOptions = {},
+): Promise<AuthoredArticlePage> {
+  const status = options.status ?? ARTICLE_STATUS.PUBLISHED;
+  const take = options.take ?? PROFILE_PAGE_SIZE;
+  const cursor = options.cursor ?? null;
+
+  const orderBy: Prisma.ArticleOrderByWithRelationInput[] =
+    status === ARTICLE_STATUS.PUBLISHED
+      ? [{ publishedAt: 'desc' }, { id: 'desc' }]
+      : [{ updatedAt: 'desc' }, { id: 'desc' }];
+
+  const rows = await getDb().article.findMany({
+    where: { authorId, status },
+    orderBy,
+    take: take + 1,
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    select: AUTHORED_SELECT,
+  });
+
+  const hasMore = rows.length > take;
+  const page = hasMore ? rows.slice(0, take) : rows;
+
+  return {
+    items: page.map((row) => ({
+      ...row,
+      tags: row.tags.map((edge) => edge.tag),
+    })),
+    nextCursor: hasMore ? (page[page.length - 1]?.id ?? null) : null,
+  };
+}
