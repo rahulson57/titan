@@ -37,9 +37,11 @@
  *     baked directory) can consequently target DIFFERENT FILES and both exit 0.
  *     That is the whole failure: it is silent, and each step individually
  *     succeeds. So this script prints the ABSOLUTE path each step resolved,
- *     fails if either lands outside the invoking repository root, and — because
- *     a derivation can go stale when Prisma's internals move — also checks
- *     AFTERWARDS that the file it named is the one that actually changed.
+ *     fails if either is not reachable through one of THIS checkout's own
+ *     entries — its root, or its `./data`, which the acceptance gate legitimately
+ *     symlinks elsewhere (DEC-068) — and, because a derivation can go stale when
+ *     Prisma's internals move, also checks AFTERWARDS that the file it named is
+ *     the one that actually changed.
  *
  * Usage:
  *   node scripts/setup.mjs [--no-browsers] [--force-env] [--quiet]
@@ -315,8 +317,9 @@ function ensureEnvLocal(total) {
 // Two independent mechanisms, because they fail in different directions.
 //
 //   DERIVATION  — resolve the absolute path each step WILL target and refuse
-//                 anything outside this checkout. Precise, names the offending
-//                 path, and fails BEFORE the step runs; but it reads a private
+//                 anything this checkout cannot reach through its own entries
+//                 (see `checkoutRoots`). Precise, names the offending path, and
+//                 fails BEFORE the step runs; but it reads a private
 //                 field out of Prisma's generated client, so a Prisma upgrade
 //                 could make it uninformative.
 //   MEASUREMENT — after the step, check that the file we named is the one that
@@ -332,6 +335,46 @@ function ensureEnvLocal(total) {
 
 /** This checkout, symlinks resolved. `node_modules` here is a shared symlink. */
 const REAL_ROOT = realpathish(ROOT);
+
+/** Memo for `checkoutDataDir()`. Resolved on first use, not at import. */
+let realDataDir = null;
+
+/**
+ * Where THIS checkout's `./data` actually lives, symlinks resolved (DEC-068).
+ *
+ * "Inside this checkout" cannot mean "under the realpath of the root", because
+ * a checkout does not have to be one contiguous directory on disk. The
+ * acceptance gate is the case that matters: Nexus materialises a clean detached
+ * checkout under $TMPDIR and symlinks every git-ignored top-level entry in from
+ * the agent worktree. `.gitignore` lists `data/`, so in a gate checkout `./data`
+ * IS a symlink, pointing at the worktree — and `./data/titan.db` realpaths to a
+ * path outside the gate root while being, by construction, exactly the database
+ * that checkout is supposed to use. Refusing it fails the gate of every task in
+ * the project, which is what the first version of this guard did.
+ *
+ * So the question is not "where does this path end up" but "did we get there
+ * through an entry of ours". `./data` is ours however it is realised; a path
+ * reached any other way — notably a relative URL resolved against a generated
+ * client baked in a DIFFERENT checkout — is not, and is still refused.
+ *
+ * Resolved lazily and memoised: step 2 creates `./data`, and resolving before
+ * that would bake in the pre-creation answer.
+ */
+function checkoutDataDir() {
+  if (realDataDir === null) realDataDir = realpathish(join(ROOT, 'data'));
+  return realDataDir;
+}
+
+/**
+ * The roots a database target may legitimately live under, most-specific last.
+ * Labelled because the refusal message has to show what was actually compared.
+ */
+function checkoutRoots() {
+  return [
+    { label: 'repository root', path: REAL_ROOT },
+    { label: './data resolves to', path: checkoutDataDir() },
+  ];
+}
 
 /**
  * `realpathSync` for a path that may not exist yet.
@@ -465,19 +508,33 @@ function howResolved({ url, source }, base) {
  * Print an absolute target and refuse it if it is outside this checkout.
  *
  * SPEC-001 puts persistent state at `./data/titan.db` INSIDE the repository, so
- * "outside the invoking repo root" is never a legitimate answer here, however
- * it was arrived at — which is why there is no override flag. A deliberate
- * cross-checkout write is still a cross-checkout write, and the reason this is
- * worth failing over is that the alternative is exit 0.
+ * a target this checkout cannot reach through its OWN entries — its root, or
+ * its `./data` however that entry is realised on disk (DEC-068) — is never a
+ * legitimate answer here, however it was arrived at. Which is why there is no
+ * override flag: a deliberate cross-checkout write is still a cross-checkout
+ * write, and the reason it is worth failing over is that the alternative is
+ * exit 0.
  */
 function assertTarget(label, path, how, unresolved = '(unresolved)') {
   say(`      db    ${label.padEnd(7)} -> ${path ?? unresolved}`);
-  if (!path || isUnder(path, REAL_ROOT)) return;
+  const roots = checkoutRoots();
+  if (!path || roots.some((root) => isUnder(path, root.path))) return;
+
+  // Width computed rather than hard-coded: the labels vary with `label`, and a
+  // refusal message whose colons do not line up is one more thing to read past
+  // at the moment someone is already looking at an unexpected failure.
+  const rows = [
+    ...roots.map((root) => [root.label, root.path]),
+    [`${label} target`, path],
+    ['resolved', how],
+  ];
+  const width = Math.max(...rows.map(([name]) => name.length));
+
   throw new Error(
     `the ${label} step would use a database OUTSIDE this checkout — refusing to run it.\n` +
-      `  repository root : ${REAL_ROOT}\n` +
-      `  ${`${label} target`.padEnd(15)} : ${path}\n` +
-      `  resolved        : ${how}\n` +
+      rows.map(([name, value]) => `  ${name.padEnd(width)} : ${value}\n`).join('') +
+      'It is under neither, so it was not reached through an entry of this\n' +
+      'checkout.\n' +
       'Every worktree on this machine shares one node_modules, so there is one\n' +
       'generated Prisma client, and whichever checkout ran `prisma generate` last\n' +
       'owns every relative DATABASE_URL (DEC-061). Re-point it at this checkout\n' +
