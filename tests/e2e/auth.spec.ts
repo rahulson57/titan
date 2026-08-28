@@ -183,9 +183,10 @@ test.describe('SPEC-005 — sign up, sign in, sign out', () => {
     createdEmails.push(account.email);
 
     await signUp(page, account);
-    // Sign-up leaves a live session, and `/signin` answers a signed-in visitor
-    // with the sign-out panel rather than a form. Drop the cookie first so this
-    // test is exercising the anonymous sign-in path it is about.
+    // Sign-up leaves a live session, and SPEC-011 redirects a signed-in visitor
+    // away from `/signin` entirely (DEC-025). Drop the cookie first so this
+    // test is exercising the anonymous sign-in path it is about — without it
+    // the form would never render to be filled in.
     await context.clearCookies();
 
     await signIn(page, account.email, 'not the right password at all');
@@ -215,13 +216,38 @@ test.describe('SPEC-005 — sign up, sign in, sign out', () => {
     const staleCookie = (await context.cookies()).find((c) => c.name === SESSION_COOKIE);
     expect(staleCookie?.value).toMatch(/^[0-9a-f]{64}$/);
 
-    // The real control, driven the way a user drives it. `/signin` renders the
-    // sign-out form for an already-signed-in visitor (SPEC-011 will move it to
-    // the user menu; the action it posts to does not change).
-    await page.goto('/signin');
+    // The real control, driven the way a user drives it. SPEC-011 has now
+    // moved sign-out into the top nav's avatar menu (DEC-025), so this drives
+    // it there: open the menu, click the item. The action it posts to is the
+    // same unmodified `signOut` server action it always was — only the
+    // navigation target and the selector have changed, and every assertion
+    // below this point is untouched.
+    //
+    // `/` rather than `/signin`, because a signed-in visitor at `/signin` is
+    // now redirected away (SPEC-011). The nav is persistent chrome, so the
+    // menu is reachable from any route; `/` is simply the one that exists.
+    await page.goto('/');
     await expect(page.locator('[data-session-handle]')).toHaveText(`@${account.handle}`);
-    await page.getByRole('button', { name: /sign out/i }).click();
-    await page.waitForURL('/');
+    await page.getByTestId('user-menu-trigger').click();
+    await page.getByTestId('user-menu-signout').click();
+
+    // Waiting for the sign-out to actually COMPLETE, which the old
+    // `waitForURL('/')` no longer does and which is worth spelling out.
+    //
+    // Sign-out is a Server Action posted from a page that is already `/`.
+    // `waitForURL('/')` checks the current URL and returns immediately when it
+    // already matches — so it resolved before the POST had even been sent, and
+    // the three assertions below then raced the server. That is not a
+    // hypothetical: it failed exactly once that way, with the session row still
+    // present, which is precisely the flaky pass SPEC-002 forbids.
+    //
+    // The nav flipping to its anonymous state is the observable effect of the
+    // action having run and the tree having re-rendered, so it is a real
+    // barrier rather than a sleep. `toHaveURL` then still pins the destination
+    // — auto-retrying, unlike the call it replaces — so "sign-out lands on `/`"
+    // remains asserted.
+    await expect(page.getByTestId('nav-signin')).toBeVisible();
+    await expect(page).toHaveURL('/');
 
     // Half one: the row is gone. This is what makes revocation real.
     expect(await sessionCountFor(userId)).toBe(0);
@@ -245,9 +271,15 @@ test.describe('SPEC-005 — sign up, sign in, sign out', () => {
     ]);
 
     // `/signin` asks `auth()`, which resolves the cookie against the database.
-    // A stale id resolves to nothing, so the page renders the sign-in FORM
-    // rather than the signed-in panel — that is "treated as anonymous",
-    // observed rather than asserted about internals.
+    // A stale id resolves to nothing, so the visitor is anonymous, so SPEC-011's
+    // signed-in redirect does NOT fire and the sign-in FORM renders — that is
+    // "treated as anonymous", observed rather than asserted about internals.
+    //
+    // This is the assertion that would break if the redirect had been put in
+    // middleware, which sees only that a cookie is present and would bounce
+    // this visitor away from the page they need. It is here, on the page,
+    // against a live-session check (DEC-025a) — so a dead cookie is anonymous
+    // and this holds verbatim.
     await page.goto('/signin');
     await expect(page.locator('[data-session-handle]')).toHaveCount(0);
     await expect(page.getByRole('button', { name: /^sign in$/i })).toBeVisible();

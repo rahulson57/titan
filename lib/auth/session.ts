@@ -155,14 +155,49 @@ export function ownsProfile(user: SessionUser | null, targetUserId: string): boo
 }
 
 /**
+ * The upload directories that SPEC-006's storage table gives a per-user level.
+ *
+ * Deliberately a closed set rather than "any segment", and deliberately NOT
+ * including `seed`. SPEC-006 lists four directories under `public/uploads/`:
+ * `avatars/`, `covers/` and `inline/` are `<kind>/<userId>/<cuid2>.webp`, but
+ * `seed/**` is flat tracked fixture images with no user level at all. Reading
+ * a user id out of position 2 of a seed path would compare the caller's id
+ * against a filename, and admitting `seed` as a kind would let
+ * `/uploads/seed/<attacker-controlled>/x.webp` claim ownership of a directory
+ * that is shipped in the repo. Neither is a path any user owns, so both are
+ * refused.
+ */
+const OWNED_UPLOAD_KINDS: ReadonlySet<string> = new Set(['avatars', 'covers', 'inline']);
+
+/**
  * SPEC-005: "Only the owning user may ... upload to their avatar/cover paths."
  *
  * SPEC-006 owns the upload pipeline and the on-disk layout; this only knows the
  * rule it must satisfy — a per-user directory whose segment is the user's id.
  * The traversal check is here rather than in the uploader because it is an
- * authorization property: `public/uploads/<other-user>/../<me>/x.webp` names a
- * path inside the caller's own directory while *claiming* another user's
- * segment, and a plain `startsWith` on the raw string would wave it through.
+ * authorization property: `public/uploads/<kind>/<other-user>/../<me>/x.webp`
+ * names a path inside the caller's own directory while *claiming* another
+ * user's segment, and a plain `startsWith` on the raw string would wave it
+ * through.
+ *
+ * ── Where the user id actually is (TASK-015) ───────────────────────────
+ * This originally read `segments[uploadsAt + 1]`, the segment straight after
+ * `uploads`. SPEC-006's storage table and architecture.md:97 both put the
+ * **kind** there and the user id one further along:
+ *
+ *     public/uploads/ avatars / <userId> / <cuid2>.webp
+ *                     ^kind     ^id
+ *
+ * So against a real stored path it compared `'avatars' === user.id` and denied
+ * the legitimate owner of every upload the product emits. The failure was
+ * fail-CLOSED — `kind` is drawn from a fixed vocabulary that can never equal a
+ * cuid2 user id, so it could only ever wrongly deny, never wrongly grant —
+ * which is why nothing shipped was exploitable and why TASK-005's uploader
+ * enforced ownership directly instead of calling this.
+ *
+ * The kind is validated rather than skipped over. Reading position 2 blindly
+ * would accept `/uploads/<userId>/<userId>/x.webp` and, worse, treat the
+ * flat `seed/` tree as if it had an owner — see `OWNED_UPLOAD_KINDS`.
  */
 export function ownsUploadPath(user: SessionUser | null, path: string): boolean {
   if (!user) return false;
@@ -171,7 +206,9 @@ export function ownsUploadPath(user: SessionUser | null, path: string): boolean 
   const segments = normalized.split('/').filter(Boolean);
   const uploadsAt = segments.indexOf('uploads');
   if (uploadsAt === -1) return false;
-  return segments[uploadsAt + 1] === user.id;
+  const kind = segments[uploadsAt + 1];
+  if (kind === undefined || !OWNED_UPLOAD_KINDS.has(kind)) return false;
+  return segments[uploadsAt + 2] === user.id;
 }
 
 /**
