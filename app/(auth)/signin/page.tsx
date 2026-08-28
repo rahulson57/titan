@@ -18,19 +18,24 @@
  * version does not: **it works with JavaScript disabled**, which on the one
  * page that gates access to the whole account is worth having.
  *
- * ── And it is what makes sign-out testable ─────────────────────────────────
- * SPEC-011 owns the top nav and the user menu that will eventually host the
- * sign-out control, and that slice has not landed. Meanwhile SPEC-005's oracle
- * requires `tests/e2e/auth.spec.ts` to prove that signing out deletes the
- * Session row and that the stale cookie is then anonymous — which needs a real
- * control to click, in this slice, today.
+ * ── The signed-in case: redirect, per SPEC-011 (DEC-025) ──────────────────
+ * This page used to answer an already-signed-in visitor with a "You are signed
+ * in as X" panel hosting the only Sign out control in the product. That was
+ * always an interim arrangement, and this file said so: SPEC-011 owns the top
+ * nav and the user menu, and TASK-004's note here read *"SPEC-011 will move it
+ * to the user menu; the action it posts to does not change."* That is what has
+ * now happened — `components/nav/UserMenu.tsx` hosts `Sign out` as a form
+ * posting to the same unmodified `signOut` action, and carries the
+ * `data-session-handle` observation SPEC-005's oracle reads.
  *
- * Rendering that control HERE is not a workaround, it is the better answer to
- * a question this page has to handle regardless: what should `/signin` do for
- * someone who is already signed in? Bouncing them silently to `/` (the first
- * thing middleware did) tells them nothing. Saying "you are signed in as X"
- * and offering the way out is the honest response, and it happens to be the
- * one that leaves the action reachable.
+ * So the panel is gone and SPEC-011's rule applies: *"`/signin`, `/signup` —
+ * anonymous — signed-in visitor → redirect `/`."*
+ *
+ * The redirect itself is NOT here. It lives once, in `app/(auth)/layout.tsx`,
+ * because `/signup` is a Client Component and cannot host a server guard —
+ * DEC-030. Two guards for one rule is how one of them goes stale unnoticed, so
+ * this page deliberately has none, and no longer calls `auth()` at all: with
+ * the signed-in panel gone there is nothing left here that needs a session.
  *
  * ── Why the styles are inline ──────────────────────────────────────────────
  * SPEC-003 (TASK-002) owns `app/globals.css`, which is not in this task's file
@@ -45,9 +50,8 @@ import type { CSSProperties } from 'react';
 
 import { Button } from '../../../components/ui/Button';
 import { NEXT_PARAM, safeNextPath } from '../../../lib/auth/config';
-import { auth } from '../../../lib/auth/session';
 import { signInErrorMessage } from '../../../lib/auth/validation';
-import { signInFromForm, signOut } from '../actions';
+import { signInFromForm } from '../actions';
 
 const column: CSSProperties = {
   maxWidth: '26rem',
@@ -109,35 +113,6 @@ function first(value: string | string[] | undefined): string | undefined {
 export default async function SignInPage({ searchParams }: PageProps) {
   const params = await searchParams;
   const next = safeNextPath(first(params[NEXT_PARAM]) ?? null);
-  const session = await auth();
-
-  if (session) {
-    return (
-      <main style={column}>
-        <h1 style={{ font: 'var(--text-h1)', marginBottom: 'var(--space-5)' }}>
-          You are signed in
-        </h1>
-        <p style={{ marginBottom: 'var(--space-6)', color: 'var(--fg-muted)' }}>
-          Signed in as <strong data-session-handle>@{session.user.handle}</strong>.
-        </p>
-        {/*
-          A plain form posting straight to the Server Action — no client
-          component, no handler. `signOut` deletes the Session row and clears
-          the cookie, which is what makes the revocation real rather than a
-          client-side pretence (DEC-005).
-        */}
-        <form action={signOut}>
-          <Button type="submit" variant="secondary" style={{ width: '100%' }}>
-            Sign out
-          </Button>
-        </form>
-        <p style={{ marginTop: 'var(--space-5)', fontSize: 'var(--text-meta-size)' }}>
-          <Link href="/">Back to reading</Link>
-        </p>
-      </main>
-    );
-  }
-
   const error = signInErrorMessage(first(params.error));
 
   return (
