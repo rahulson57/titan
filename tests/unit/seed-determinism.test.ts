@@ -71,10 +71,14 @@ describe('SPEC-002 — the determinism fingerprint is trustworthy', () => {
     expect(hashRows([{ id: 'a' }])).not.toBe(hashRows([{ id: 'a' }, { id: 'a' }]));
   });
 
-  it('scopes each model to exactly the columns the criterion names', () => {
+  it('scopes each model to exactly the columns that identify one of its rows', () => {
     expect(DETERMINISTIC_COLUMNS.Article).toEqual(['id', 'slug', 'createdAt']);
     expect(DETERMINISTIC_COLUMNS.User).toEqual(['id', 'createdAt']);
-    expect(DETERMINISTIC_COLUMNS.Clap).toEqual(['id', 'createdAt']);
+    // Clap's key is composite — `@@id([userId, articleId])` per SPEC-004 —
+    // so there is no `id` column to project. Naming one hashed null for every
+    // row; see the pairing test below for what that concealed.
+    expect(DETERMINISTIC_COLUMNS.Clap).toEqual(['userId', 'articleId', 'createdAt']);
+    expect(DETERMINISTIC_COLUMNS.Clap).not.toContain('id');
   });
 
   it('ignores columns outside that set, so a legitimately volatile field cannot fail the gate', () => {
@@ -84,11 +88,69 @@ describe('SPEC-002 — the determinism fingerprint is trustworthy', () => {
     );
   });
 
+  // ── The Clap pairing regression ──────────────────────────────────────────
+  // The three pairing tests below each FAIL against the previous
+  // `['id', 'createdAt']` projection: with no `id` column on the model, every
+  // clap row canonicalised to `{"createdAt":<iso>,"id":null}`, so the identity
+  // of a clap was invisible to the hash. The fourth passes either way — it
+  // pins the deliberately narrow projection that must survive this repair.
+
+  it('detects a clap reassigned to a different article', () => {
+    const at = SEED_BASE_TIMESTAMP;
+    const original = [
+      { userId: 'u1', articleId: 'a1', count: 3, createdAt: at },
+      { userId: 'u2', articleId: 'a2', count: 7, createdAt: at },
+    ];
+    // Same users, same articles, same timestamps, same cardinality — only WHO
+    // clapped WHAT is swapped. This is the seed regression the gate is for.
+    const permuted = [
+      { userId: 'u1', articleId: 'a2', count: 3, createdAt: at },
+      { userId: 'u2', articleId: 'a1', count: 7, createdAt: at },
+    ];
+    expect(hashModel('Clap', permuted)).not.toBe(hashModel('Clap', original));
+  });
+
+  it('detects a clap reassigned to a different user', () => {
+    const base = { articleId: 'a1', count: 1, createdAt: SEED_BASE_TIMESTAMP };
+    expect(hashModel('Clap', [{ ...base, userId: 'u1' }])).not.toBe(
+      hashModel('Clap', [{ ...base, userId: 'u2' }]),
+    );
+  });
+
+  it('does not collapse distinct claps that share a timestamp', () => {
+    // The sharpest form of the old defect: three different rows hashing as one
+    // repeated row. Distinct pairings must stay distinguishable from a set that
+    // merely repeats a single pairing the same number of times.
+    const at = SEED_BASE_TIMESTAMP;
+    const distinct = [
+      { userId: 'u1', articleId: 'a1', createdAt: at },
+      { userId: 'u2', articleId: 'a2', createdAt: at },
+      { userId: 'u3', articleId: 'a3', createdAt: at },
+    ];
+    const repeated = [
+      { userId: 'u1', articleId: 'a1', createdAt: at },
+      { userId: 'u1', articleId: 'a1', createdAt: at },
+      { userId: 'u1', articleId: 'a1', createdAt: at },
+    ];
+    expect(hashModel('Clap', distinct)).not.toBe(hashModel('Clap', repeated));
+  });
+
+  it('still ignores a clap column the criterion does not name', () => {
+    // `count` is mutable engagement state (SPEC-004: 1..50 per reader), not
+    // row identity. The projection stays narrow on Clap for the same reason it
+    // does on Article — widening it is how a later legitimate change breaks
+    // this gate for the wrong reason.
+    const base = { userId: 'u1', articleId: 'a1', createdAt: SEED_BASE_TIMESTAMP };
+    expect(hashModel('Clap', [{ ...base, count: 1 }])).toBe(
+      hashModel('Clap', [{ ...base, count: 50 }]),
+    );
+  });
+
   it('rolls the three models into one comparable fingerprint', () => {
     const snapshot = {
       User: [{ id: 'u1', createdAt: SEED_BASE_TIMESTAMP }],
       Article: [{ id: 'a1', slug: 's', createdAt: SEED_BASE_TIMESTAMP }],
-      Clap: [{ id: 'c1', createdAt: SEED_BASE_TIMESTAMP }],
+      Clap: [{ userId: 'u1', articleId: 'a1', count: 5, createdAt: SEED_BASE_TIMESTAMP }],
     };
     expect(fingerprint(snapshot)).toBe(fingerprint({ ...snapshot }));
     expect(fingerprint(snapshot)).not.toBe(fingerprint({ ...snapshot, Clap: [] }));
@@ -168,11 +230,19 @@ describe.skipIf(!READY)(
       // SPEC-002 states the budgets against "50 users / 500 articles / 2 000
       // claps". A smaller corpus would make every p95 below pass for the
       // wrong reason.
+      //
+      // DEC-009: that "500 articles" is the PUBLISHED count, not the total.
+      // SPEC-004 seeds 540 rows (500 PUBLISHED + 40 DRAFT) and its own
+      // criterion says so outright; the budgets are stated against the
+      // published corpus, so the assertion is scoped by status rather than
+      // relaxed. The total is pinned too, so neither half can drift.
       db ??= await createTestDatabase();
       runSeed(db.url);
       const { User, Article, Clap } = await snapshot(db);
       expect(User.length).toBe(50);
-      expect(Article.length).toBe(500);
+      expect(Article.filter((row) => row.status === 'PUBLISHED')).toHaveLength(500);
+      expect(Article.filter((row) => row.status === 'DRAFT')).toHaveLength(40);
+      expect(Article.length).toBe(540);
       expect(Clap.length).toBe(2000);
     });
   },

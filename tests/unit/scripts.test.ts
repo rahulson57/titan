@@ -102,6 +102,45 @@ describe('SPEC-002 — the web server is bound to port 3000', () => {
     expect(WEB_SERVER.timeout).toBe(60_000);
   });
 
+  /**
+   * Regression guard — the gate hang.
+   *
+   * A run once passed every test and then never exited, burning nine minutes
+   * before an outer timeout killed it with no failure to read. The cause was
+   * `reuseExistingServer: !process.env.CI`: with no CI variable set, Playwright
+   * adopted a `next dev` it had not started, and Playwright only tears down web
+   * servers it started itself. The adopted process outlived the run holding the
+   * stdio pipes it had inherited, so the parent `npm test` sat waiting on a pipe
+   * that would never close.
+   *
+   * The three properties below are what make that impossible. None of them
+   * shows up as a test failure when it regresses — the suite goes green and
+   * then hangs — so they are asserted directly.
+   */
+  it('never adopts a web server it did not start', () => {
+    // Also a correctness property, not only a hygiene one: the criterion is
+    // that a *clean boot* answers on 3000, and adopting a server started from
+    // some other commit would satisfy the assertion while proving nothing.
+    expect(WEB_SERVER.reuseExistingServer).toBe(false);
+  });
+
+  it('shuts the server tree down gracefully instead of orphaning it on 3000', () => {
+    // `npm run dev` is npm -> next -> next-server. Killing the group without
+    // asking first can leave the grandchild holding the port, which turns into
+    // the *next* run failing to bind.
+    expect(WEB_SERVER.gracefulShutdown).toEqual({ signal: 'SIGTERM', timeout: 5_000 });
+    expect(WEB_SERVER.stdout).toBe('pipe');
+    expect(WEB_SERVER.stderr).toBe('pipe');
+  });
+
+  it('bounds the whole run so a teardown hang fails loudly rather than silently', () => {
+    // Per-test timeouts do not bound teardown. Whatever ends a stuck run should
+    // be Playwright, because Playwright says why.
+    const globalTimeout = playwrightConfig.globalTimeout ?? Infinity;
+    expect(globalTimeout).toBeGreaterThan(0);
+    expect(globalTimeout).toBeLessThanOrEqual(8 * 60_000);
+  });
+
   it('attaches the web server exactly when there is an app to serve', () => {
     // `next dev` exits immediately without an App Router entry point, so a
     // webServer attached to an app-less tree would fail every e2e run on a
@@ -251,7 +290,7 @@ describe('SPEC-002 — no guard can hide once its dependency lands', () => {
  * provider is. Pinning both to the same exact version is what keeps the two
  * halves in step regardless of which copy of the core gets invoked.
  *
- * Exact versions, not ranges: `^3.2.4` on both sides still permits an install
+ * Exact versions, not ranges: `^3.2.7` on both sides still permits an install
  * that resolves the two packages to different minors.
  */
 describe('SPEC-002 — the runner cannot be assembled from mismatched halves', () => {
