@@ -15,15 +15,36 @@
  * owned by TASK-002 and `app/page.tsx` by TASK-007. Until one lands, `next
  * dev` has nothing to serve and Playwright attaches no web server (see
  * playwright.config.ts). Nothing here needs editing when that changes.
+ *
+ * ── `npm run setup` is executed by globalSetup, not from in here ───────────
+ * These tests used to shell out to `scripts/setup.mjs` themselves. That put a
+ * `prisma migrate deploy` in the middle of a Playwright run, after other specs
+ * had already driven the app — a race that fails outright once the app has
+ * written anything: an open Prisma connection that has WRITTEN blocks the
+ * migration engine from taking its write lock, and the schema engine does not
+ * inherit the app's `busy_timeout`, so it fails instantly rather than waiting.
+ *
+ * `tests/e2e/global.setup.ts` therefore runs setup — twice, since idempotency
+ * is only observable across two runs — before any TEST runs, and these tests
+ * assert the OUTCOME. The criteria are unchanged; only who executes them moved.
+ * Note the invariant precisely (DEC-023): `globalSetup` runs AFTER `webServer`
+ * boots, not before it. What makes the move safe is that no test has written
+ * yet at that point — "setup before the app's first WRITE", not "setup before
+ * the server starts". The reasoning, and what would break it, is in
+ * `tests/e2e/global.setup.ts`.
+ *
+ * Authorised by the operator in MSG-2261 as part of TASK-004, which is where
+ * the latent defect surfaced: SPEC-005's sign-up was the first e2e write in
+ * the project, and SPEC-006/007/009/010 would each have hit it in turn.
  */
 
 import { expect, test } from '@playwright/test';
-import { execFileSync } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { appIsBootable, BASE_URL } from '../../playwright.config';
+import { BOOT_SETUP } from './global.setup';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')) as {
@@ -38,14 +59,18 @@ test.describe('SPEC-001 — boot contract preconditions', () => {
   });
 
   test('`npm run setup` succeeds on a tree with no ./data/ and no .env.local', () => {
-    // The contract is specifically about a *clean clone*. Running setup for
-    // real is the only way to know it does not depend on state a previous run
-    // left behind. It is re-runnable by design, so this is safe here.
-    execFileSync('node', ['scripts/setup.mjs', '--quiet', '--no-browsers'], {
-      cwd: REPO_ROOT,
-      stdio: 'pipe',
-      timeout: 120_000,
-    });
+    // Executed for real by globalSetup, before any test had run. Running it
+    // for real is still the point: it is the only way to know setup does not
+    // depend on state a previous run left behind.
+    //
+    // The failure output is included in the message deliberately. The previous
+    // version asserted an exit code with stderr discarded, so a broken gate
+    // reported only "Command failed: npx prisma migrate deploy" — the actual
+    // SQLite error had to be recovered by instrumenting the harness by hand.
+    expect(
+      process.env[BOOT_SETUP.ok],
+      `npm run setup failed in globalSetup:\n${process.env[BOOT_SETUP.error] ?? '(no output captured)'}`,
+    ).toBe('1');
 
     expect(existsSync(join(REPO_ROOT, 'data')), 'setup must create ./data/').toBe(true);
     expect(existsSync(join(REPO_ROOT, '.env.local')), 'setup must generate .env.local').toBe(true);
@@ -64,13 +89,15 @@ test.describe('SPEC-001 — boot contract preconditions', () => {
   test('setup is idempotent — a second run does not rotate the secret', () => {
     // Rotating AUTH_SECRET on every setup would sign every existing session
     // out, which turns a routine `npm run setup` into a surprise logout.
-    const before = readFileSync(join(REPO_ROOT, '.env.local'), 'utf8');
-    execFileSync('node', ['scripts/setup.mjs', '--quiet', '--no-browsers'], {
-      cwd: REPO_ROOT,
-      stdio: 'pipe',
-      timeout: 120_000,
-    });
-    expect(readFileSync(join(REPO_ROOT, '.env.local'), 'utf8')).toBe(before);
+    //
+    // Only observable across two runs, so globalSetup performs both and
+    // compares `.env.local` byte for byte — any rewrite between identical runs
+    // is a non-idempotency worth failing on, not just a rotated secret.
+    expect(
+      process.env[BOOT_SETUP.idempotent],
+      'a second `npm run setup` rewrote .env.local — the AUTH_SECRET rotated, ' +
+        'which signs out every existing session',
+    ).toBe('1');
   });
 });
 

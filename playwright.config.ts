@@ -87,6 +87,28 @@ export const WEB_SERVER = {
 export default defineConfig({
   testDir: './tests',
 
+  /**
+   * `npm run setup` runs HERE, once per run, rather than from inside a test.
+   *
+   * This is a correctness fix, not tidying. Setup runs `prisma migrate deploy`,
+   * and the migration engine cannot get its write lock while a Prisma
+   * connection that has WRITTEN is still open — which is exactly what a running
+   * dev server is once anyone has signed up. Measured: connection open and
+   * read-only, migrate succeeds; open and has written, "database is locked";
+   * closed, succeeds.
+   *
+   * Be precise about why that helps, because the invariant is narrower than it
+   * looks (DEC-023): `globalSetup` runs AFTER `webServer` boots, not before.
+   * What makes it safe is that no TEST has run yet, so the server has read but
+   * not written. The rule to preserve is "setup runs before the app's first
+   * WRITE" — anything that writes on boot breaks it. Full reasoning in
+   * tests/e2e/global.setup.ts.
+   *
+   * Authorised by the operator (MSG-2261) as part of TASK-004, which is where
+   * the latent defect first surfaced.
+   */
+  globalSetup: './tests/e2e/global.setup.ts',
+
   // `.spec.ts` is Playwright's; `.test.ts` is Vitest's. See vitest.config.ts.
   testMatch: '**/*.spec.ts',
 
