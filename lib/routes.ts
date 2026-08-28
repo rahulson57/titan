@@ -174,19 +174,33 @@ export function isPageFile(repoRelativePath: string): boolean {
  *     that does not exist.
  *   - `app/page.tsx` is the root, `/`, not the empty string.
  *
- * ── The `@` hazard, flagged for whoever builds `/@[handle]` (TASK-010) ─────
- * SPEC-011 specifies the profile route as `/@[handle]`, and this mapper treats
- * a leading `@` as a literal path segment so that the spec's own notation
- * round-trips. Be aware that Next reads a folder beginning with `@` as a
- * **parallel-route slot**, not as a path segment — `app/@[handle]/page.tsx`
- * would very likely be interpreted as a slot named `[handle]` and would not
- * serve `/@someone` at all. Whoever owns Profiles has to pick a directory
- * shape that actually produces this URL (a catch-all or dynamic segment that
- * matches the `@` prefix is the usual answer) and, if that shape's directory
- * name differs from the URL, this mapper is where the equivalence belongs.
- * Raising it here rather than guessing: the profile route is not this slice's
- * to design, and a wrong guess baked into the enforcement test would block the
- * slice that is.
+ * ── The `@` hazard, RESOLVED (TASK-010 / DEC-049) ─────────────────────────
+ * The paragraph that used to sit here warned that Next "would very likely"
+ * read a folder beginning with `@` as a parallel-route slot, and left the
+ * equivalence to whoever built Profiles. That turned out to be right, and
+ * worse than it sounded. It was then measured twice, independently, on a
+ * dev server:
+ *
+ *     app/@[handle]/page.tsx PRESENT :  / -> 500  /@x -> 500  /tag/craft -> 500
+ *     app/@[handle]/ REMOVED         :  / -> 200  /@x -> 404  /tag/craft -> 200
+ *
+ * The mechanism is `normalizeAppPath` in
+ * `next/dist/shared/lib/router/utils/app-paths.js`:
+ *
+ *     // Parallel segments are ignored.
+ *     if (segment[0] === '@') { return pathname }
+ *
+ * So `app/@[handle]/page.tsx` normalizes to `/` and COLLIDES with
+ * `app/page.tsx`, taking down every route in the app rather than merely
+ * failing to serve one. There is no escape hatch either: `route-regex.js`
+ * special-cases `%5F` -> `_` and nothing else, so a `%40[handle]` folder would
+ * serve the literal path `/%40x`.
+ *
+ * `/@handle` is still the URL SPEC-010 and SPEC-011 specify, and it is still
+ * what the product serves — via `app/[handle]/page.tsx`, a root dynamic
+ * segment whose page calls `notFound()` for any value not starting with `@`.
+ * `DIRECTORY_ROUTE_OVERRIDES` below is the equivalence this comment promised
+ * would live here.
  *
  * Returns `null` when the path is not a routable page file.
  */
@@ -204,8 +218,33 @@ export function routeForPageFile(repoRelativePath: string): string | null {
     path.push(segment);
   }
 
-  return path.length === 0 ? '/' : `/${path.join('/')}`;
+  const derived = path.length === 0 ? '/' : `/${path.join('/')}`;
+  return DIRECTORY_ROUTE_OVERRIDES.get(derived) ?? derived;
 }
+
+/**
+ * Directory shapes whose URL is not their concatenation, and cannot be.
+ *
+ * ONE entry, and the bar for a second is high: every row here is a place where
+ * reading the tree no longer tells you what the tree serves, which is exactly
+ * the property this module exists to provide. A route belongs here only when
+ * Next's own conventions make the honest directory name impossible — not when
+ * a different name would merely be tidier.
+ *
+ * `/[handle]` -> `/@[handle]`: see the note on `routeForPageFile` above, and
+ * the guard in `app/[handle]/page.tsx` that makes the mapping true of the
+ * running product rather than only of this table. The two halves are tested
+ * together — `tests/unit/route-map.test.ts` pins this entry, and
+ * `tests/e2e/profile-page.spec.ts` drives the real URL through a browser, so
+ * an entry here that the page did not honour would fail rather than paper over.
+ *
+ * The direction matters: this maps FILE -> URL. `profileHref` already emits
+ * `/@handle` and is unchanged, so nothing that links to a profile had to learn
+ * about the directory shape.
+ */
+const DIRECTORY_ROUTE_OVERRIDES: ReadonlyMap<string, string> = new Map([
+  ['/[handle]', '/@[handle]'],
+]);
 
 // ---------------------------------------------------------------------------
 // Href builders — the only place a route string is spelled

@@ -293,13 +293,56 @@ describe('SPEC-011 — app/ path to URL follows the App Router conventions', () 
     }
   });
 
-  it('keeps a leading @ as a literal segment, per the spec notation', () => {
-    // SPEC-011 writes the profile route as `/@[handle]`, so the mapper has to
-    // agree with the spec's own notation or the table can never match a file.
-    // The hazard — Next reads a leading `@` as a parallel-route slot — is
-    // documented at length in lib/routes.ts for whoever builds Profiles.
-    expect(routeForPageFile('app/@[handle]/page.tsx')).toBe('/@[handle]');
+  it('maps the profile directory to the URL the spec names (DEC-049)', () => {
+    // SPEC-011 writes the profile route as `/@[handle]`, and the product
+    // serves exactly that — but it CANNOT do so from a directory of that name.
+    // Next's `normalizeAppPath` drops any segment beginning with `@` as a
+    // parallel-route slot, so `app/@[handle]/page.tsx` normalizes to `/`,
+    // collides with `app/page.tsx`, and 500s every route in the app. Measured
+    // twice independently before this line was written; the mechanism and the
+    // evidence are in lib/routes.ts.
+    //
+    // So the file is `app/[handle]/page.tsx` and this equivalence is what keeps
+    // the closed-world sweep honest about it.
+    expect(routeForPageFile('app/[handle]/page.tsx')).toBe('/@[handle]');
     expect(isKnownPageRoute('/@[handle]')).toBe(true);
+  });
+
+  it('does not leave `/[handle]` reachable as a route of its own', () => {
+    // The override is a rename, not an alias. If `/[handle]` were ALSO a known
+    // route, a second page file could appear at the root dynamic segment and
+    // pass the sweep — which is the exact hole the closed world exists to
+    // close, since that file would serve every unmatched root URL.
+    expect(isKnownPageRoute('/[handle]')).toBe(false);
+    expect(ROUTES.map((r) => r.pattern)).not.toContain('/[handle]');
+  });
+
+  it('overrides only that one directory, and only exactly', () => {
+    // A prefix or substring match here would silently rewrite unrelated
+    // routes. `/[handle]` is the whole path or it is nothing.
+    expect(routeForPageFile('app/settings/[handle]/page.tsx')).toBe('/settings/[handle]');
+    expect(routeForPageFile('app/[handle]/edit/page.tsx')).toBe('/[handle]/edit');
+    expect(routeForPageFile('app/[handleish]/page.tsx')).toBe('/[handleish]');
+  });
+
+  it('still maps every other directory by plain concatenation', () => {
+    // The override must not have turned the mapper into a lookup table: the
+    // sweep's value is that an UNANTICIPATED page file is mapped correctly and
+    // then rejected, and a mapper that only knew the routes it was told about
+    // would map a new file to nothing and fail open.
+    expect(routeForPageFile('app/admin/secrets/page.tsx')).toBe('/admin/secrets');
+    expect(isKnownPageRoute('/admin/secrets')).toBe(false);
+  });
+
+  it('serves the profile route from a file that Next can actually route', () => {
+    // The half of DEC-049 that a unit test can hold: the page file the sweep
+    // matches must not be the one that breaks the app. Asserted against the
+    // real tree, so a future rename back to `@[handle]` fails here — in
+    // milliseconds — rather than as a 500 on every page of a running server.
+    expect(PAGE_FILES).not.toContain('app/@[handle]/page.tsx');
+    expect(ALL_APP_FILES.filter((file) => file.split('/').some((s) => s.startsWith('@')))).toEqual(
+      [],
+    );
   });
 });
 
