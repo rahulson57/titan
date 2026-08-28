@@ -26,6 +26,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { appIsBootable } from '../../playwright.config';
+import { disconnectDb, getDb } from '../../lib/db/client';
 
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
@@ -40,7 +41,32 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
  */
 const SURFACES = [
   { name: 'home feed', path: '/', source: 'app/page.tsx', owner: 'TASK-007 (Feed & Search)' },
-  { name: 'article', path: '/article/hello-world', source: 'app/article/[slug]/page.tsx', owner: 'TASK-009 (Reading & Engagement)' },
+  // `path` is a fallback; `resolve` is what actually runs. The literal it
+  // replaced was `/article/hello-world`, and no such slug can exist: SPEC-004
+  // mints slugs as `kebab(title)-<6 chars of the article id>`. So this surface
+  // audited the 404 page, and the sealed criterion — "0 serious and 0 critical
+  // on /article/[slug] in BOTH themes" — had never once been evaluated against
+  // an article. It skipped while TASK-009 was unbuilt, which hid it.
+  //
+  // Same trap `nav.spec.ts` carried, fixed the same way (MSG-2430): resolve a
+  // real row, so a 404 here means "the route is not built" and never "that row
+  // does not exist".
+  {
+    name: 'article',
+    path: '/article/hello-world',
+    resolve: async () => {
+      const article = await getDb().article.findFirst({
+        where: { status: 'PUBLISHED' },
+        select: { slug: true },
+        // Ordered by id so every run audits the same article — SPEC-002's
+        // determinism rule covers what a test selects, not only what the seed writes.
+        orderBy: { id: 'asc' },
+      });
+      return article ? `/article/${article.slug}` : null;
+    },
+    source: 'app/article/[slug]/page.tsx',
+    owner: 'TASK-009 (Reading & Engagement)',
+  },
   { name: 'editor', path: '/editor/new', source: 'app/editor/new/page.tsx', owner: 'TASK-006 (Editor & Content)' },
   // TASK-010 / DEC-049. Two corrections, and both were live defects:
   //
@@ -129,6 +155,16 @@ async function auditedTheRightPage(
 test.describe('SPEC-002 — zero serious or critical axe violations', () => {
   test.skip(!appIsBootable(), 'waiting on TASK-002 / TASK-007: no bootable app to audit yet');
 
+  // Resolving a real slug means this suite now opens the app's Prisma
+  // connection in the RUNNER process, so it has to close it — the same
+  // `afterAll` every other database-touching spec here carries. Without it the
+  // connection is held for the whole run, and with `workers: 1` that is a
+  // second writer against one SQLite file for every suite that follows. It
+  // surfaces far away from here, as an unrelated later suite failing to write.
+  test.afterAll(async () => {
+    await disconnectDb();
+  });
+
   for (const surface of SURFACES) {
     for (const theme of THEMES) {
       test(`${surface.name} (${surface.path}) in ${theme} theme`, async ({ page }) => {
@@ -142,7 +178,19 @@ test.describe('SPEC-002 — zero serious or critical axe violations', () => {
             'the page cannot be put into dark mode — auditing it now would just re-audit light',
         );
 
-        await applyTheme(page, theme, surface.path);
+        // Merge of TASK-009 and TASK-010, both of which fixed a different half
+        // of the same false-pass class. TASK-009 resolves the article surface
+        // from a real seeded row (the literal slug could never exist); TASK-010
+        // asserts, for surfaces that opt in, that the audit actually landed on
+        // the page it claims. They compose: resolve the URL first, then confirm
+        // the browser arrived somewhere that is really that surface.
+        const path = 'resolve' in surface ? await surface.resolve() : surface.path;
+        test.skip(
+          path === null,
+          `the seed corpus holds no row to build ${surface.name} from`,
+        );
+
+        await applyTheme(page, theme, path as string);
         await auditedTheRightPage(page, surface);
 
         // @axe-core/playwright bundles its own copy of playwright-core's types,
