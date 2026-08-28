@@ -45,14 +45,21 @@
  * size when SPEC-003 next opens.
  *
  * ── The action slot, and why Follow is not built here ─────────────────────
- * SPEC-009 owns "the clap/bookmark/follow mutations" and TASK-009 is in
- * flight. Building a second follow action here would duplicate work that is
- * coming and leave two mutations to keep in agreement. So `action` is a slot,
- * exactly as `ArticleCard.actions` is a slot "for engagement controls owned by
- * SPEC-009", and the page fills it. The one thing this component DOES enforce
- * is the half of the rule that is Profiles' own: `isOwner` renders **Edit
- * profile** and never a follow control, so a self-follow button cannot appear
- * however the slot is filled.
+ * SPEC-009 owns "the clap/bookmark/follow mutations". Building a second follow
+ * action here would leave two mutations to keep in agreement — and the
+ * self-follow rule that SPEC-009 makes a 400 `SelfFollowError` would have two
+ * places to be got right. So `action` is a slot, exactly as
+ * `ArticleCard.actions` is a slot "for engagement controls owned by SPEC-009",
+ * and the page fills it. The one thing this component DOES enforce is the half
+ * of the rule that is Profiles' own: `isOwner` renders **Edit profile** and
+ * never a follow control, so a self-follow button cannot appear however the
+ * slot is filled.
+ *
+ * As of TASK-021 the slot is filled, by `app/[handle]/page.tsx`, with
+ * SPEC-009's own `FollowButton` — not a copy of it. That is what makes the
+ * `isOwner` branch below load-bearing rather than decorative: until something
+ * could appear there, "no Follow button on your own profile" was true of every
+ * profile for the uninteresting reason that it was true of every page.
  */
 
 import type { CSSProperties, ReactNode } from 'react';

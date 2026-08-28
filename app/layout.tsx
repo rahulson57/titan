@@ -1,10 +1,11 @@
 import type { Metadata, Viewport } from 'next';
 import type { ReactNode } from 'react';
 import { Inter, Source_Serif_4 } from 'next/font/google';
+import Script from 'next/script';
 
 import './globals.css';
 import { TopNav } from '../components/nav/TopNav';
-import { THEME_INIT_SCRIPT } from '../lib/theme';
+import { THEME_INIT_SCRIPT, THEME_INIT_SCRIPT_ID } from '../lib/theme';
 
 /**
  * Root layout — the design system's entry point (SPEC-003).
@@ -36,6 +37,15 @@ import { THEME_INIT_SCRIPT } from '../lib/theme';
  * `RootLayout` stays SYNCHRONOUS. `TopNav` is the async component — it is the
  * one that reads the session — so the dynamic dependency is confined to the
  * subtree that needs it and the pre-paint script path is unchanged.
+ *
+ * ── The theme script is now rendered twice (TASK-019) ─────────────────────
+ * The blocking `<script>` below is still in its original position and still
+ * does all the work on every document the server renders. A second copy went
+ * in beside it because there is one document the server does NOT render — the
+ * stand-in Next sends when `notFound()` is thrown from inside a page — and on
+ * that one the blocking tag is reproduced into the DOM but never executed. The
+ * measurements, the alternatives rejected, and what is still not fixed are all
+ * written out at the call site.
  */
 
 /**
@@ -115,6 +125,79 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           to reconcile, so server and client markup differ by construction.
         */}
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+
+        {/*
+          ── The same script again, and why that is not belt-and-braces ─────
+          TASK-019. The tag above is the only theme code that runs on a
+          document the SERVER produced. There is one document this app serves
+          that the server does not produce, and on it the tag above never
+          executes at all.
+
+          When `notFound()` is thrown from INSIDE a page — `/article/<unknown
+          slug>`, `/editor/<unknown id>` — Next 15.5 does not server-render the
+          not-found tree the way it does for an unmatched path. It abandons the
+          shell and sends a stand-in document of its own:
+
+              <html id="__next_error__"><head>…no stylesheet, no theme
+              script…</head><body>…flight payload…</body></html>
+
+          …then renders the whole real tree, root layout included, on the
+          CLIENT out of that payload. Measured on this repo at 15.5.24, in
+          `next dev` and in `next build && next start` alike:
+
+            | path                         | status | served <html>          |
+            |------------------------------|--------|------------------------|
+            | /article/<real slug>         | 200    | lang+class (ours)      |
+            | /no-such-page  (router 404)  | 404    | lang+class (ours)      |
+            | /article/<unknown slug>      | 404    | id="__next_error__"    |
+            | /editor/<unknown id>         | 404    | id="__next_error__"    |
+
+          React reproduces this `<script>` element into that document's head —
+          it is visible in the DOM afterwards — but it does not RUN it. A
+          script element React creates and inserts never executes its inline
+          text; only the HTML parser starts a parser-inserted script. So the
+          class was never applied, `style.colorScheme` stayed empty, and a
+          dark-mode reader got a permanently white 404. Not a flash that
+          settles: it never settled.
+
+          `next/script` is the fix because its client path does the one thing
+          React's renderer deliberately will not — `document.createElement`,
+          set the text, append — which executes. `afterInteractive` places that
+          in an effect, and this tag sits in `<head>`, so the effect runs ahead
+          of every effect inside `<body>`; `ThemeToggle` therefore still reads
+          a document that already carries the right class and cannot mount
+          showing the wrong label.
+
+          Three things deliberately NOT done, each measured before it was
+          rejected:
+
+          - Replacing the tag above with `strategy="beforeInteractive"`. Next
+            then emits it as a deferred external script instead of a blocking
+            inline one, and EVERY page — `/` included — went white-then-dark on
+            first paint. That is SPEC-003's no-flash criterion, broken
+            everywhere, to fix one page.
+          - Making `app/not-found.tsx` a client component and applying the
+            theme in a layout effect. It works, and it is ~13 ms faster on the
+            in-page-404 path, but it costs that file its `metadata` export and
+            its no-JavaScript posture — a real regression on the router-404
+            path, which renders correctly today, bought for 13 ms of a ~200 ms
+            window this file cannot close (see below).
+          - Nothing at all on the grounds that "the flash is Next's". The
+            residual IS Next's, but the missing class was ours to apply.
+
+          What this does NOT fix, stated plainly so nobody reads the green as
+          more than it is: Next's stand-in document carries no stylesheet
+          either, so its first paint is an unstyled white frame ~200 ms wide in
+          dev, and no code in this repo runs before it. The reader still sees
+          white on an in-page 404; they now see it for the width of that frame
+          instead of forever. Closing it means stopping Next from taking the
+          stand-in path at all, which is not reachable from these three files.
+        */}
+        <Script
+          id={THEME_INIT_SCRIPT_ID}
+          strategy="afterInteractive"
+          dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }}
+        />
       </head>
       <body>
         {/* SPEC-011's persistent chrome. Above `{children}` so it is the first

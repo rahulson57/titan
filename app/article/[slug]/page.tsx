@@ -62,7 +62,7 @@ import { findUserById } from '../../../lib/db/users';
 import { readBookmarkState } from '../../../lib/engage/bookmark';
 import { CLAP_BURST_MS, MAX_CLAPS_PER_READER, readClapState } from '../../../lib/engage/clap';
 import { readFollowState } from '../../../lib/engage/follow';
-import { tagHref } from '../../../lib/routes';
+import { articleHref, tagHref } from '../../../lib/routes';
 
 export const dynamic = 'force-dynamic';
 
@@ -250,7 +250,11 @@ export default async function ArticlePage({ params }: PageProps) {
         <FollowProvider
           authorId={author.id}
           authorName={author.name}
-          slug={article.slug}
+          // Where an anonymous viewer returns after signing in. `FollowProvider`
+          // takes the destination rather than the slug (TASK-021) so the same
+          // control serves `/@[handle]`, which has no article to return to;
+          // `articleHref` keeps this page's route spelled in `lib/routes.ts`.
+          returnTo={articleHref(article.slug)}
           signedIn={signedIn}
           isSelf={viewer?.id === author.id}
           initialFollowing={follow.following}

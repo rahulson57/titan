@@ -14,6 +14,14 @@
  *   - A profile with no `coverPath` renders the gradient placeholder element and
  *     issues zero failed image requests.
  *
+ * ── The seventh thing asserted here, which is not a sealed criterion ──────
+ * SPEC-010's region table asks for a Follow / Following toggle in the header's
+ * action region, but no sealed criterion requires a working one — criterion 28
+ * only forbids one on your OWN profile. An absence criterion with nothing that
+ * could be present passes against a product that never built the control, so
+ * "the non-owner sees it, and following writes a row" is asserted here too
+ * (TASK-021). Without that pair, criterion 28 is green and empty.
+ *
  * ── Why the fixture has a draft AND a published article ───────────────────
  * "The Drafts tab is absent for a non-owner" is unfalsifiable against an author
  * with no drafts: the tab would be missing either way and the assertion would
@@ -449,14 +457,120 @@ test.describe('SPEC-010 — the public profile at /@handle', () => {
     await expect(page.getByTestId('profile-page')).toHaveAttribute('data-tab', 'bookmarks');
     await expect(page.getByTestId('profile-feed')).toContainText(bookmarkedTitle);
 
-    // Criterion: own profile shows Edit profile and never a Follow button.
+    // Criterion 28: own profile shows Edit profile and never a Follow button.
     await expect(page.getByTestId('profile-edit-link')).toBeVisible();
     await expect(page.getByTestId('profile-edit-link')).toHaveAttribute(
       'href',
       '/settings/profile',
     );
+
+    // ── The assertion that can actually fail (TASK-021) ────────────────────
+    // The two role queries below were written when no follow control existed
+    // anywhere in the product, and they were the whole of this criterion. They
+    // are kept, but they were never able to catch the defect they name, and
+    // filling the slot did not change that: SPEC-009's control labels itself
+    // `aria-label="Follow <author name>"`, so its accessible name here would
+    // be "Follow Ada Lovelace", never the bare "Follow" these anchored regexes
+    // require. Rendering it for the owner leaves both at zero.
+    //
+    // Measured, not reasoned: with `isOwner` forced false in
+    // `ProfileHeader.tsx` so the owner DOES get a follow control, the two role
+    // assertions still passed and only the test-id assertion below went red.
+    // That is why it is here, and why the role queries were not simply
+    // "already covering it".
+    await expect(page.getByTestId('profile-header').getByTestId('follow-button')).toHaveCount(0);
     await expect(page.getByRole('button', { name: /^follow(ing)?$/i })).toHaveCount(0);
     await expect(page.getByRole('link', { name: /^follow(ing)?$/i })).toHaveCount(0);
+
+    await context.close();
+  });
+
+  // -------------------------------------------------------------------------
+  // SPEC-010's action region: the Follow / Following toggle (TASK-021)
+  //
+  // The counterpart to criterion 28. That criterion only says what must NOT be
+  // on your own profile, so on its own it is satisfied by a product with no
+  // follow control at all — which is exactly what this suite was asserting
+  // until now. These two tests are what make the absence meaningful, by
+  // establishing that the control is present and works for everybody else.
+  // -------------------------------------------------------------------------
+
+  test('an anonymous visitor gets a Follow control that returns them to the PROFILE', async ({
+    browser,
+  }) => {
+    // The single reason the article page's control could not simply be dropped
+    // into this slot: it built its own sign-in destination out of a slug, and
+    // a profile has no article to send anyone back to. `returnTo` is that
+    // generalisation, and this is the assertion that it was actually made —
+    // `%2F%40handle` here, not `%2Farticle%2F...`.
+    const context = await browser.newContext();
+    const page = await context.newPage();
+
+    await page.goto(`/@${owner.handle}`);
+
+    const control = page.getByTestId('profile-header').getByTestId('follow-button');
+    await expect(control).toBeVisible();
+    await expect(control).toHaveAttribute('data-signed-in', 'false');
+    await expect(control).toHaveAttribute('href', `/signin?next=%2F%40${owner.handle}`);
+
+    // And the destination survives the round trip rather than merely being
+    // spelled correctly in the href. `/@handle` is the one route in the map
+    // whose path contains a character that has to be percent-encoded to get
+    // into a query string and decoded again on the way out, so "the href looks
+    // right" and "the reader lands back where they were" are genuinely two
+    // different claims here.
+    await control.click();
+    await page.waitForURL(/\/signin\?next=/);
+    await page.getByLabel('Email').fill(stranger.email);
+    await page.getByLabel('Password').fill(stranger.password);
+    await page.getByRole('button', { name: /^sign in$/i }).click();
+    await page.waitForURL(new RegExp(`/@${owner.handle}$`));
+
+    // The stranger follows the owner in `beforeAll`, so the control they are
+    // returned to reflects the relationship that already exists rather than
+    // resetting to "Follow".
+    await expect(page.getByTestId('profile-header').getByTestId('follow-button')).toHaveAttribute(
+      'data-following',
+      'true',
+    );
+
+    await context.close();
+  });
+
+  test('a signed-in non-owner can follow from the header, and the follow is written', async ({
+    browser,
+  }) => {
+    // Deliberately against `pager` rather than `owner`: the header-render test
+    // pins the owner's follower count at exactly 1, and a suite whose tests
+    // move numbers other tests assert is a suite that fails on reordering
+    // rather than on a defect.
+    const context = await browser.newContext();
+    const page = await context.newPage();
+    await signUp(page, freshAccount('pffol'));
+
+    await page.goto(`/@${pager.handle}`);
+
+    const control = page.getByTestId('profile-header').getByTestId('follow-button');
+    await expect(control).toBeVisible();
+    await expect(control).toHaveAttribute('data-signed-in', 'true');
+    await expect(control).toHaveAttribute('aria-pressed', 'false');
+    await expect(control).toHaveText(/^follow$/i);
+    await expect(page.getByTestId('profile-follower-count')).toHaveAttribute('data-count', '0');
+
+    await control.click();
+    await expect(control).toHaveAttribute('aria-pressed', 'true');
+    await expect(control).toHaveText(/^following$/i);
+
+    // The reload is the point. Everything above it is satisfied by an
+    // optimistic flip that never reached the database; `followAction`
+    // deliberately does not `revalidatePath`, so the row is the only thing
+    // that can survive a fresh request — and the header's `COUNT(*)` moving
+    // with it is the same write observed through a second, independent read.
+    await page.reload();
+    const reloaded = page.getByTestId('profile-header').getByTestId('follow-button');
+    await expect(reloaded).toHaveAttribute('aria-pressed', 'true');
+    await expect(reloaded).toHaveText(/^following$/i);
+    await expect(page.getByTestId('profile-follower-count')).toHaveAttribute('data-count', '1');
 
     await context.close();
   });
