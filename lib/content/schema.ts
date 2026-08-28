@@ -852,128 +852,176 @@ export function parseHtmlToDoc(html: string): ContentNode {
   if (typeof html !== 'string' || html.trim().length === 0) return emptyDoc();
 
   const root: Frame = { type: 'doc', marks: [], children: [], tag: '', opaque: false };
-  const stack: Frame[] = [root];
-
-  const top = (): Frame => stack[stack.length - 1] ?? root;
-
-  const emit = (node: ContentNode) => {
-    const frame = top();
-    if (!frame.opaque) frame.children.push(node);
-  };
-
-  const closeFrame = () => {
-    const frame = stack.pop();
-    if (!frame) return;
-    if (frame.opaque) return;
-
-    if (frame.type === null) {
-      // Transparent wrapper: hand the children up.
-      for (const child of frame.children) emit(child);
-      return;
-    }
-    const node: ContentNode = { type: frame.type };
-    if (frame.attrs) node.attrs = frame.attrs;
-    if (frame.children.length > 0) node.content = frame.children;
-    emit(node);
-  };
+  const state: ParseState = { root, stack: [root] };
 
   for (const token of tokenizeHtml(html)) {
-    if (token.kind === 'text') {
-      const frame = top();
-      if (frame.opaque) continue;
-      const node: ContentNode = { type: 'text', text: token.text };
-      if (frame.marks.length > 0) node.marks = frame.marks;
-      emit(node);
-      continue;
-    }
-
-    if (token.kind === 'close') {
-      // Find the matching open frame. An unmatched close tag is ignored rather
-      // than closing something it did not open, which is what keeps a stray
-      // `</div>` from unwinding the whole document.
-      const at = [...stack].reverse().findIndex((frame) => frame.tag === token.name);
-      if (at === -1) continue;
-      const target = stack.length - 1 - at;
-      while (stack.length > target && stack.length > 1) closeFrame();
-      continue;
-    }
-
-    const name = token.name;
-
-    if (isOpaqueType(name) || !(name in HTML_ELEMENTS || name in HTML_MARKS)) {
-      // Unknown or dangerous. Void ones vanish outright; the rest open a frame
-      // that swallows its children so nothing inside reaches the document.
-      if (!token.selfClosing) {
-        stack.push({
-          type: null,
-          marks: top().marks,
-          children: [],
-          tag: name,
-          opaque: isOpaqueType(name),
-        });
-      }
-      continue;
-    }
-
-    const markType = HTML_MARKS[name];
-    if (markType) {
-      const mark = sanitizeMark({ type: markType, attrs: token.attrs });
-      const frame = top();
-      const marks = mark
-        ? sanitizeMarks([...frame.marks, mark]) ?? frame.marks
-        : frame.marks;
-      if (!token.selfClosing) {
-        stack.push({ type: null, marks, children: [], tag: name, opaque: frame.opaque });
-      }
-      continue;
-    }
-
-    const nodeType = HTML_ELEMENTS[name] ?? null;
-    const frame = top();
-
-    if (nodeType === null) {
-      if (!token.selfClosing) {
-        stack.push({
-          type: null,
-          marks: frame.marks,
-          children: [],
-          tag: name,
-          opaque: frame.opaque,
-        });
-      }
-      continue;
-    }
-
-    const rawAttrs: Record<string, unknown> = { ...token.attrs };
-    if (nodeType === 'heading') {
-      // h1/h2 collapse to 2, everything deeper to 3 — the schema has no h4+, and
-      // flattening a deep outline upward reads better than dropping it.
-      rawAttrs.level = Number(name.slice(1)) >= 3 ? 3 : 2;
-    }
-
-    const attrs = nodeAttrs(nodeType, rawAttrs);
-    if (!attrs.ok) continue;
-
-    if (token.selfClosing || NODE_SPECS[nodeType].content === 'leaf') {
-      const node: ContentNode = { type: nodeType };
-      if (attrs.attrs) node.attrs = attrs.attrs;
-      emit(node);
-      continue;
-    }
-
-    stack.push({
-      type: nodeType,
-      attrs: attrs.attrs,
-      marks: nodeType === 'codeBlock' ? [] : frame.marks,
-      children: [],
-      tag: name,
-      opaque: frame.opaque,
-    });
+    if (token.kind === 'text') appendTextToken(state, token);
+    else if (token.kind === 'close') closeMatchingFrame(state, token.name);
+    else openTokenFrame(state, token);
   }
 
-  while (stack.length > 1) closeFrame();
+  while (state.stack.length > 1) closeTopFrame(state);
 
   // Straight through the same closer the save path uses: this function and
   // `sanitizeDoc` cannot disagree, because one ends by calling the other.
   return sanitizeDoc({ type: 'doc', content: root.children });
+}
+
+/**
+ * The parser's whole mutable state: the document frame and the open frames above
+ * it. `root` is kept alongside the stack so `topFrame` has a total answer without
+ * throwing on an empty stack — the stack is never popped past `root`, so the
+ * fallback is unreachable rather than a silent recovery.
+ */
+interface ParseState {
+  root: Frame;
+  stack: Frame[];
+}
+
+/** The frame currently being filled. */
+function topFrame(state: ParseState): Frame {
+  return state.stack[state.stack.length - 1] ?? state.root;
+}
+
+/** Add `node` to the frame being filled, unless that frame discards its children. */
+function emitNode(state: ParseState, node: ContentNode): void {
+  const frame = topFrame(state);
+  if (!frame.opaque) frame.children.push(node);
+}
+
+/** Pop the innermost frame and fold it into its parent. */
+function closeTopFrame(state: ParseState): void {
+  const frame = state.stack.pop();
+  if (!frame || frame.opaque) return;
+
+  if (frame.type === null) {
+    // Transparent wrapper: hand the children up.
+    for (const child of frame.children) emitNode(state, child);
+    return;
+  }
+
+  const node: ContentNode = { type: frame.type };
+  if (frame.attrs) node.attrs = frame.attrs;
+  if (frame.children.length > 0) node.content = frame.children;
+  emitNode(state, node);
+}
+
+/** Append a text token, carrying whatever marks the enclosing frames contribute. */
+function appendTextToken(state: ParseState, token: HtmlToken): void {
+  const frame = topFrame(state);
+  if (frame.opaque) return;
+  const node: ContentNode = { type: 'text', text: token.text };
+  if (frame.marks.length > 0) node.marks = frame.marks;
+  emitNode(state, node);
+}
+
+/**
+ * Close frames up to and including the one `name` opened. An unmatched close tag is
+ * ignored rather than closing something it did not open, which is what keeps a stray
+ * `</div>` from unwinding the whole document.
+ */
+function closeMatchingFrame(state: ParseState, name: string): void {
+  const at = [...state.stack].reverse().findIndex((frame) => frame.tag === name);
+  if (at === -1) return;
+  const target = state.stack.length - 1 - at;
+  while (state.stack.length > target && state.stack.length > 1) closeTopFrame(state);
+}
+
+/** Route an open tag to the one frame kind it can produce. */
+function openTokenFrame(state: ParseState, token: HtmlToken): void {
+  const name = token.name;
+
+  if (isOpaqueType(name) || !(name in HTML_ELEMENTS || name in HTML_MARKS)) {
+    openDroppedFrame(state, token);
+    return;
+  }
+
+  const markType = HTML_MARKS[name];
+  if (markType) {
+    openMarkFrame(state, token, markType);
+    return;
+  }
+
+  openElementFrame(state, token);
+}
+
+/**
+ * Open a frame for an element the schema has no node for — unknown tags, and the
+ * dangerous ones whose children must not survive either. Void ones vanish outright;
+ * the rest open a frame that swallows its children so nothing inside reaches the
+ * document.
+ */
+function openDroppedFrame(state: ParseState, token: HtmlToken): void {
+  if (token.selfClosing) return;
+  state.stack.push({
+    type: null,
+    marks: topFrame(state).marks,
+    children: [],
+    tag: token.name,
+    opaque: isOpaqueType(token.name),
+  });
+}
+
+/** Open a transparent frame that contributes one mark to every text node inside it. */
+function openMarkFrame(state: ParseState, token: HtmlToken, markType: MarkType): void {
+  const frame = topFrame(state);
+  const mark = sanitizeMark({ type: markType, attrs: token.attrs });
+  const marks = mark
+    ? sanitizeMarks([...frame.marks, mark]) ?? frame.marks
+    : frame.marks;
+  if (token.selfClosing) return;
+  state.stack.push({ type: null, marks, children: [], tag: token.name, opaque: frame.opaque });
+}
+
+/**
+ * Open a frame for a mapped element. A `null` mapping is transparent: the tag itself
+ * contributes no node, but its children still do.
+ */
+function openElementFrame(state: ParseState, token: HtmlToken): void {
+  const frame = topFrame(state);
+  const nodeType = HTML_ELEMENTS[token.name] ?? null;
+
+  if (nodeType === null) {
+    if (!token.selfClosing) {
+      state.stack.push({
+        type: null,
+        marks: frame.marks,
+        children: [],
+        tag: token.name,
+        opaque: frame.opaque,
+      });
+    }
+    return;
+  }
+
+  const attrs = nodeAttrs(nodeType, rawAttrsFor(token, nodeType));
+  if (!attrs.ok) return;
+
+  if (token.selfClosing || NODE_SPECS[nodeType].content === 'leaf') {
+    const node: ContentNode = { type: nodeType };
+    if (attrs.attrs) node.attrs = attrs.attrs;
+    emitNode(state, node);
+    return;
+  }
+
+  state.stack.push({
+    type: nodeType,
+    attrs: attrs.attrs,
+    marks: nodeType === 'codeBlock' ? [] : frame.marks,
+    children: [],
+    tag: token.name,
+    opaque: frame.opaque,
+  });
+}
+
+/**
+ * The attributes handed to `nodeAttrs`. Headings need one adjustment the tag name
+ * carries rather than the attributes: h1/h2 collapse to level 2 and anything deeper
+ * to 3, because the schema has no h4+ and flattening a deep outline upward reads
+ * better than dropping it.
+ */
+function rawAttrsFor(token: HtmlToken, nodeType: NodeType): Record<string, unknown> {
+  const attrs: Record<string, unknown> = { ...token.attrs };
+  if (nodeType === 'heading') attrs.level = Number(token.name.slice(1)) >= 3 ? 3 : 2;
+  return attrs;
 }
