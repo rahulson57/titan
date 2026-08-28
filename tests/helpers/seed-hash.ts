@@ -34,11 +34,25 @@ export const SEED_BASE_TIMESTAMP = '2026-01-01T00:00:00.000Z';
  * The columns the determinism criterion names, per model. Hashing exactly
  * these — rather than the whole row — keeps the gate meaningful when a later
  * slice adds a column that is legitimately non-deterministic.
+ *
+ * SPEC-002 names the criterion's columns as the set `(id, slug, createdAt)`,
+ * which is a shorthand read across all three models rather than a literal
+ * column list for each one. `Clap` has no `id`: its primary key is composite,
+ * `@@id([userId, articleId])` (SPEC-004, prisma/schema.prisma). Projecting
+ * `id` there produced `{"createdAt":<iso>,"id":null}` for EVERY clap row, so
+ * the entire identity of a clap — which user clapped which article — was
+ * outside the hash and a seed that reshuffled those pairings still produced a
+ * byte-identical fingerprint. The projection below is that key, spelled out.
+ *
+ * The rule for extending this map: name the columns that IDENTIFY a row in the
+ * schema, not every column it has. `Clap.count` is deliberately absent for the
+ * same reason `Article.title` is — see the volatile-column test in
+ * `tests/unit/seed-determinism.test.ts`.
  */
 export const DETERMINISTIC_COLUMNS = {
   User: ['id', 'createdAt'],
   Article: ['id', 'slug', 'createdAt'],
-  Clap: ['id', 'createdAt'],
+  Clap: ['userId', 'articleId', 'createdAt'],
 } as const;
 
 export type DeterministicModel = keyof typeof DETERMINISTIC_COLUMNS;
