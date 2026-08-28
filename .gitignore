@@ -27,3 +27,8 @@ test-results/
 # Local runtime state — SPEC-001 puts the SQLite database under ./data/,
 # created by `npm run setup` on a clean clone and never committed
 data/
+
+# Local media uploads (SPEC-006) — user uploads are ignored, seed fixtures are tracked.
+# Order matters: the negation MUST follow the wildcard or public/uploads/seed/ is lost.
+public/uploads/*
+!public/uploads/seed/
