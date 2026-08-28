@@ -35,7 +35,13 @@ import { createUser } from '../../lib/db/users';
 import { createArticle, publishArticle, unpublishArticle } from '../../lib/db/articles';
 import { setArticleTags } from '../../lib/db/tags';
 import { follow } from '../../lib/db/social';
-import { getFeedPage, getFollowingPage, getTagPage, getPopularTags } from '../../lib/feed/queries';
+import {
+  getFeedPage,
+  getFollowingPage,
+  getPopularTags,
+  getTagPage,
+  hydrateRanked,
+} from '../../lib/feed/queries';
 import { ensureSearchIndex, searchArticles } from '../../lib/search/fts';
 
 const NOW = new Date('2026-04-01T00:00:00.000Z');
@@ -146,6 +152,29 @@ describe.each([
     const ids = hits.map((item) => item.id);
     expect(ids).toEqual(expect.arrayContaining(PUBLISHED_IDS));
     for (const hidden of HIDDEN) expect(ids).not.toContain(hidden);
+  });
+});
+
+describe('SPEC-008 — the last read before a card is built re-checks status', () => {
+  it('drops a draft id even when the caller hands it one directly', async () => {
+    // Not a hypothetical. Every caller filters, but an author can unpublish
+    // between a projection and its hydration — and `unpublishArticle`
+    // deliberately RETAINS `publishedAt`, so the row still looks renderable.
+    // Handing the hydrator a draft id simulates exactly that race.
+    const items = await hydrateRanked(
+      [...DRAFT_IDS, ...PUBLISHED_IDS].map((id) => ({ id, score: 1 })),
+      NOW,
+    );
+    expect(items.map((item) => item.id).sort()).toEqual([...PUBLISHED_IDS].sort());
+  });
+
+  it('preserves the order it was handed, so ranking is not undone by hydration', async () => {
+    const reversed = [...PUBLISHED_IDS].reverse();
+    const items = await hydrateRanked(
+      reversed.map((id, index) => ({ id, score: 100 - index })),
+      NOW,
+    );
+    expect(items.map((item) => item.id)).toEqual(reversed);
   });
 });
 

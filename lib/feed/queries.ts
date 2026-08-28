@@ -214,7 +214,14 @@ export async function hydrateRanked(
 
   const ids = ranked.map((row) => row.id);
   const [rows, clapTotals] = await Promise.all([
-    getDb().article.findMany({ where: { id: { in: ids } }, select: CARD_SELECT }),
+    // `PUBLISHED_ONLY` again, not just the ids. Every caller has already
+    // filtered — but between a projection and its hydration an author can
+    // unpublish, and `unpublishArticle` deliberately RETAINS `publishedAt`,
+    // so a row that has just become a draft still looks perfectly renderable
+    // here. Re-stating the rule at the last read before the card is built
+    // means the race closes as a missing card rather than as a draft on a
+    // public page.
+    getDb().article.findMany({ where: { id: { in: ids }, ...PUBLISHED_ONLY }, select: CARD_SELECT }),
     clapTotalsFor(ids),
   ]);
 
