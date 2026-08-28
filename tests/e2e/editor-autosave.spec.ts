@@ -252,20 +252,45 @@ test.describe('SPEC-007 — autosave', () => {
     // Wait for the edit to reach the DATABASE, not merely for the indicator to
     // read `Saved`.
     //
-    // This is a race fix, and the race is real rather than theoretical — it
-    // failed a gate run here. A draft opened from a saved row shows `Saved` on
-    // load, because that is its honest state, so `toHaveText('Saved')` can
-    // match the state the page ARRIVED in and return before the first autosave
-    // has run at all. The rest of the test then simulates the other tab while
-    // this page still has a save in flight, and the two writes race: whichever
-    // lands second wins, and the assertion below compares against the loser.
+    // `toHaveText('Saved')` alone cannot carry this precondition: a draft opened
+    // from a saved row reads `Saved` because that is its honest state, and React
+    // has not necessarily committed the `Unsaved changes` render by the time the
+    // assertion first polls. So it can match the state the page ARRIVED in and
+    // return while the first autosave is still in flight — after which the
+    // simulated other-tab write below races it, and whichever lands second
+    // wins. Polling the row waits for the write itself, which is the actual
+    // precondition.
     //
-    // Polling the row removes the ambiguity entirely — it waits for the exact
-    // precondition the test needs (this page's edit is persisted and its
-    // version is current) rather than for a label that is also true one moment
-    // too early.
+    // ── The timeout is 30s, and the message is instrumented, deliberately ────
+    // This test failed three acceptance-gate runs while passing locally in every
+    // configuration tried: warm and cold `.next`, freshly seeded and reused
+    // database, isolated and in the full suite. The gate reported the row's
+    // `bodyText` still empty, i.e. the first save had simply not landed.
+    //
+    // Because the cause is not reproducible here, this does two things rather
+    // than one. The longer budget removes "the gate box is slower than this one"
+    // as an explanation — 30s is 15x the 2s debounce and still well inside the
+    // 60s per-test timeout. And the failure message reports the indicator text
+    // and the row's version, so if it fails again the artifact says WHICH of the
+    // three possibilities happened: `Save failed — retry` (the request errored),
+    // `Saving…` (still in flight), or `Saved` with an unchanged version (a 409).
+    // The previous failure said only `Received string: ""`, which distinguishes
+    // none of them.
     await expect
-      .poll(async () => (await getArticleById(articleId))?.bodyText ?? '', { timeout: 10_000 })
+      .poll(
+        async () => {
+          const row = await getArticleById(articleId);
+          const indicator = await page.getByTestId('save-indicator').textContent();
+          return `${row?.bodyText ?? '<no row>'} | indicator=${indicator} | version=${row?.version}`;
+        },
+        {
+          timeout: 30_000,
+          message:
+            'the first autosave never reached the database. The indicator and version above say ' +
+            'which failure this was: "Save failed — retry" means the request errored, "Saving…" ' +
+            'means it was still in flight, and "Saved" with an unchanged version means a 409.',
+        },
+      )
       .toContain('local edit');
     await expect(page.getByTestId('save-indicator')).toHaveText('Saved', { timeout: 10_000 });
 
