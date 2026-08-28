@@ -268,7 +268,39 @@ test.describe('SPEC-007 — publishing', () => {
     expect(after?.bodyText).toBe(published?.bodyText);
   });
 
-  test('an unpublished article leaves the home feed', async ({ page }) => {
+  /**
+   * ── Amended by TASK-007 (SPEC-008), on the operator's ruling in MSG-2427 ──
+   *
+   * This test was correct when it was written and was made unsatisfiable by a
+   * later slice — a spec-evolution artifact, not an error by anyone. It is
+   * recorded here rather than in a commit message because the next person to
+   * read it will otherwise re-introduce the original assertion.
+   *
+   * It used to publish an article and require it on **page 1 of `/`**. `/` was
+   * S01's placeholder then, so "the home feed" could only mean "whatever `/`
+   * lists". SPEC-008 then made `/` a RANKED feed, and a ranked feed makes no
+   * placement promise to new work:
+   *
+   *     score = ln(1 + clapTotal) + 2.0 * exp(-ageHours / 72.0)
+   *
+   * The recency term cannot exceed `2.0` at any freshness, so a brand-new
+   * unclapped article scores exactly 2.000. Measured against the seed corpus,
+   * page 1 cuts at 5.328 (its twentieth article has 205 claps) — a new article
+   * would need ~28 claps to appear there. Unreachable by construction, not
+   * flaky.
+   *
+   * So presence is now asserted on `/tag/craft`, which SPEC-008 defines as
+   * "published articles with that tag, **newest first**" — where a
+   * just-published article is guaranteed to be row one. The article is already
+   * tagged `craft` two lines below; nothing about the fixture changed.
+   *
+   * The absence half got STRONGER rather than weaker, which is the point.
+   * `/` alone was vacuous: the article was never on page 1, so that assertion
+   * passed whether or not unpublishing did anything at all. Checking the tag
+   * page — where it demonstrably WAS present a moment earlier — is what
+   * actually catches an unpublish that fails to withdraw the article.
+   */
+  test('an unpublished article leaves the tag page and the home feed', async ({ page }) => {
     test.skip(!hasHomeFeed(), WAITING_ON_FEED);
 
     const articleId = await openDraft(page, GOOD_BODY);
@@ -277,15 +309,20 @@ test.describe('SPEC-007 — publishing', () => {
     await expect(page.getByTestId('article-status')).toHaveText('Published', { timeout: 15_000 });
 
     const slug = (await getArticleById(articleId))?.slug ?? '';
-    await page.goto('/');
-    await expect(page.locator(`a[href="/article/${slug}"]`)).toHaveCount(1);
+    const link = `a[href="/article/${slug}"]`;
+
+    await page.goto('/tag/craft');
+    await expect(page.locator(link)).toHaveCount(1);
 
     await page.goto(`/editor/${articleId}`, { waitUntil: 'networkidle' });
     await page.getByTestId('unpublish-button').click();
     await expect(page.getByTestId('article-status')).toHaveText('Draft', { timeout: 15_000 });
 
+    await page.goto('/tag/craft');
+    await expect(page.locator(link)).toHaveCount(0);
+
     await page.goto('/');
-    await expect(page.locator(`a[href="/article/${slug}"]`)).toHaveCount(0);
+    await expect(page.locator(link)).toHaveCount(0);
   });
 
   test('an unpublished article leaves the FTS index', async ({ page }) => {
@@ -297,9 +334,34 @@ test.describe('SPEC-007 — publishing', () => {
     await page.getByTestId('publish-button').click();
     await expect(page.getByTestId('article-status')).toHaveText('Published', { timeout: 15_000 });
 
+    /**
+     * Is THIS article in the index?
+     *
+     * Amended by TASK-007 alongside the test above, and for a related reason:
+     * this probe used to count every indexed article matching `fifty`, and
+     * `fifty` comes from `GOOD_BODY`, which every fixture in this file shares.
+     * Two earlier tests — "a valid draft publishes" and "an edit and a
+     * republish" — deliberately END with their article PUBLISHED, so by the
+     * time this one runs there are already two other indexed articles
+     * containing the word. `toBe(0)` could then never hold, however perfectly
+     * the triggers behaved.
+     *
+     * It went unnoticed because the whole test was skipped until SPEC-008's
+     * triggers landed: `hasFtsTriggers()` returned false, so the assertion had
+     * never once executed. Arming it is what exposed it.
+     *
+     * Narrowing the count to `a."id" = articleId` asks the question the test's
+     * own name asks. It is also strictly stronger than a global count: a
+     * global count of zero can be reached by an over-eager trigger that empties
+     * the index entirely, and this cannot.
+     */
     const inIndex = async (): Promise<number> => {
       const rows = await getDb().$queryRawUnsafe<Array<{ n: bigint | number }>>(
-        "SELECT COUNT(*) AS n FROM article_fts WHERE article_fts MATCH 'fifty'",
+        `SELECT COUNT(*) AS n
+           FROM article_fts
+           JOIN "Article" a ON a."rowid" = article_fts."rowid"
+          WHERE article_fts MATCH 'fifty' AND a."id" = ?`,
+        articleId,
       );
       return Number(rows[0]?.n ?? 0);
     };
