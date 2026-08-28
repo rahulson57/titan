@@ -188,3 +188,23 @@ export const THEME_INIT_SCRIPT = `(function(){try{var k=${JSON.stringify(
 )})}else{r.classList.remove(${JSON.stringify(
   DARK_CLASS,
 )})}r.style.colorScheme=t}catch(e){}})();`;
+
+/**
+ * `id` for the second copy of the script — the one that repairs a document
+ * React rendered entirely on the client (TASK-019). The long explanation of
+ * *why* there are two copies is beside the call site in `app/layout.tsx`.
+ *
+ * `next/script` requires an `id` on every inline script: it is the key its
+ * loader dedupes on, so without one the script would re-execute on every
+ * client navigation. Declared here rather than as a literal at the call site
+ * so the id and the source it carries stay in one place.
+ *
+ * The second copy is safe because `THEME_INIT_SCRIPT` is idempotent by
+ * construction: it derives the theme from `localStorage` + `matchMedia` and
+ * *assigns* the result (`classList.add`/`remove`, `style.colorScheme = t`). It
+ * never toggles and never reads back the class it is about to write, so a
+ * second run against an unchanged environment is a no-op and a second run
+ * after the environment changed converges on the new answer. The two copies
+ * cannot fight.
+ */
+export const THEME_INIT_SCRIPT_ID = 'titan-theme-init';
