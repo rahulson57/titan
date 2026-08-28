@@ -23,6 +23,7 @@ import { createTestDatabase, type TestDatabase } from '../helpers/db';
 import { disconnectDb } from '../../lib/db/client';
 import {
   BIO_MAX,
+  EmptyNameError,
   InvalidHandleError,
   NAME_MAX,
   UserNotFoundError,
@@ -35,6 +36,7 @@ import {
   findUserByEmail,
   findUserByHandle,
   findUserById,
+  isValidSocial,
   normalizeEmail,
   normalizeHandle,
   parseSocials,
@@ -44,6 +46,8 @@ import {
 import {
   ARTICLE_STATUS,
   ArticleNotFoundError,
+  DerivedBodyMismatchError,
+  EmptyTitleError,
   InvalidStatusError,
   buildSlug,
   countArticlesByAuthor,
@@ -55,6 +59,7 @@ import {
   publishArticle,
   unpublishArticle,
   updateArticle,
+  type UpdateArticleInput,
 } from '../../lib/db/articles';
 import { setClap, toggleBookmark, follow } from '../../lib/db/social';
 import { attachTag } from '../../lib/db/tags';
@@ -271,6 +276,33 @@ describe('SPEC-004 — user normalisation happens on the way in, not at the call
     expect(serializeSocials(null)).toBe('{}');
   });
 
+  it('refuses an empty display name — the "1" in SPEC-004\'s "1-60 chars"', async () => {
+    await expect(
+      createUser({ email: 'e@t.local', passwordHash: 'x', handle: 'empty', name: '   ' }),
+    ).rejects.toThrow(EmptyNameError);
+
+    const user = await makeUser('named');
+    await expect(updateUser(user.id, { name: '' })).rejects.toThrow(EmptyNameError);
+    expect((await findUserById(user.id))?.name).toBe(user.name);
+  });
+
+  it('drops a social link that is neither a handle nor an http(s) URL', () => {
+    // The load-bearing case: these render as `href`s on a public profile, so a
+    // `javascript:` value accepted here is stored XSS that no view can undo.
+    expect(isValidSocial('javascript:alert(1)')).toBe(false);
+    expect(isValidSocial('data:text/html,<script>')).toBe(false);
+    expect(isValidSocial('  ')).toBe(false);
+    expect(isValidSocial('not a handle')).toBe(false);
+    expect(isValidSocial('@ada')).toBe(true);
+    expect(isValidSocial('ada-lovelace')).toBe(true);
+    expect(isValidSocial('https://example.test/ada')).toBe(true);
+    expect(isValidSocial('http://example.test')).toBe(true);
+
+    expect(
+      serializeSocials({ twitter: 'javascript:alert(1)', website: 'https://example.test' }),
+    ).toBe(JSON.stringify({ website: 'https://example.test' }));
+  });
+
   it('names its own error type for a missing user', () => {
     expect(new UserNotFoundError('id x').name).toBe('UserNotFoundError');
   });
@@ -340,7 +372,11 @@ describe('SPEC-004 — the article write paths keep derived columns and the slug
       now: AT,
     });
     const longer = Array.from({ length: 1_000 }, () => 'word').join(' ');
-    const updated = await updateArticle(article.id, { bodyJson: doc(longer), now: LATER });
+    const updated = await updateArticle(article.id, {
+      bodyJson: doc(longer),
+      bodyHtml: `<p>${longer}</p>`,
+      now: LATER,
+    });
     expect(updated.bodyText).toBe(longer);
     expect(updated.readingMinutes).toBe(Math.ceil(1_000 / 238));
     expect(updated.version).toBe(2); // optimistic-concurrency counter advanced
@@ -469,11 +505,53 @@ describe('SPEC-004 — the article write paths keep derived columns and the slug
     const cleared = await updateArticle(article.id, {
       subtitle: null,
       coverPath: null,
+      bodyJson: doc('x'),
       bodyHtml: '<p>x</p>',
       now: AT,
     });
     expect(cleared.subtitle).toBeNull();
     expect(cleared.coverPath).toBeNull();
     expect(cleared.bodyHtml).toBe('<p>x</p>');
+  });
+
+  it('refuses a title that is empty or only whitespace, rather than minting `untitled-…`', async () => {
+    const author = await makeUser('author');
+    await expect(
+      createArticle({ authorId: author.id, title: '   ', bodyJson: doc('body'), bodyHtml: '' }),
+    ).rejects.toThrow(EmptyTitleError);
+
+    const article = await createArticle({
+      authorId: author.id,
+      title: 'Real title',
+      bodyJson: doc('body'),
+      bodyHtml: '',
+      now: AT,
+    });
+    await expect(updateArticle(article.id, { title: '' })).rejects.toThrow(EmptyTitleError);
+  });
+
+  it('will not let bodyJson move without the bodyHtml derived from it', async () => {
+    // The type union makes this a compile error for typed callers; the runtime
+    // guard is for the untyped ones, so it has to be asserted through a cast.
+    const author = await makeUser('author');
+    const article = await createArticle({
+      authorId: author.id,
+      title: 'Drift',
+      bodyJson: doc('before'),
+      bodyHtml: '<p>before</p>',
+      now: AT,
+    });
+
+    const bodyOnly = { bodyJson: doc('after') } as unknown as UpdateArticleInput;
+    await expect(updateArticle(article.id, bodyOnly)).rejects.toThrow(DerivedBodyMismatchError);
+
+    const htmlOnly = { bodyHtml: '<p>after</p>' } as unknown as UpdateArticleInput;
+    await expect(updateArticle(article.id, htmlOnly)).rejects.toThrow(DerivedBodyMismatchError);
+
+    // Rejected before the row is read, so a bad patch cannot half-apply.
+    const unchanged = await getArticleById(article.id);
+    expect(unchanged?.bodyText).toBe('before');
+    expect(unchanged?.bodyHtml).toBe('<p>before</p>');
+    expect(unchanged?.version).toBe(1);
   });
 });

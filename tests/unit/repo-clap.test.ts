@@ -163,4 +163,5 @@ describe('SPEC-004 — clapTotal is a read-time aggregate, never a stored column
     await db.client.$executeRawUnsafe('DELETE FROM "User" WHERE id = ?', reader);
     expect(await getClapTotal(articleId)).toBe(5);
   });
+
 });

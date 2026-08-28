@@ -27,6 +27,13 @@ export const HANDLE_PATTERN = /^[a-z0-9_]{3,24}$/;
 export const NAME_MAX = 60;
 export const BIO_MAX = 220;
 
+/**
+ * The handle shape shared by the three `socials` platforms, used to tell a bare
+ * handle from something that has to parse as a URL. Deliberately wider than
+ * `HANDLE_PATTERN`: these are other services' identifiers, not titan's.
+ */
+export const SOCIAL_HANDLE_PATTERN = /^[A-Za-z0-9_.-]{1,39}$/;
+
 /** The `socials` JSON column's shape (SPEC-004 / SPEC-010). */
 export interface SocialLinks {
   twitter?: string;
@@ -51,9 +58,59 @@ export class UserNotFoundError extends Error {
   }
 }
 
+/** SPEC-004's display name is "1–60 chars"; this is the 1. */
+export class EmptyNameError extends Error {
+  constructor() {
+    super('display name must not be empty');
+    this.name = 'EmptyNameError';
+  }
+}
+
 /** Lowercase + trim. The form every email comparison is made against. */
 export function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
+}
+
+/**
+ * Trim, then enforce SPEC-004's "display name, 1–60 chars".
+ *
+ * The upper bound truncates and the lower bound throws, which looks
+ * inconsistent but is not: a 200-character name has a sensible first 60, so
+ * cutting it keeps the write. An empty name has no sensible interpretation —
+ * storing it produces a profile and a byline that render as nothing, and the
+ * bug then surfaces on a page, far from the write that caused it.
+ */
+export function normalizeName(name: string): string {
+  const trimmed = name.trim();
+  if (trimmed.length === 0) throw new EmptyNameError();
+  return trimmed.slice(0, NAME_MAX);
+}
+
+/**
+ * SPEC-004: `socials` is `{ twitter?, github?, website? }`, "each a validated
+ * URL or handle".
+ *
+ * Accepted: a bare handle (`@ada` / `ada`, the `^[a-z0-9_.-]{1,39}$` shape all
+ * three platforms share) or an absolute `http(s)` URL. Everything else is
+ * dropped rather than thrown on, because these arrive from a free-text profile
+ * form where one malformed field should not reject the whole save.
+ *
+ * The scheme allowlist is the load-bearing half. These strings are rendered as
+ * `href`s on a public profile, so accepting `javascript:` here would make the
+ * profile form a stored-XSS vector — a validation gap in the repository layer
+ * that no amount of care in the view can close, because by then it is just a
+ * string that came out of the database.
+ */
+export function isValidSocial(value: string): boolean {
+  const trimmed = value.trim();
+  if (trimmed.length === 0 || trimmed.length > 200) return false;
+  if (SOCIAL_HANDLE_PATTERN.test(trimmed.replace(/^@/, ''))) return true;
+  try {
+    const { protocol } = new URL(trimmed);
+    return protocol === 'http:' || protocol === 'https:';
+  } catch {
+    return false;
+  }
 }
 
 /** Lowercase + trim, then validate. Throws rather than storing a bad handle. */
@@ -75,12 +132,15 @@ export function parseSocials(raw: string | null | undefined): SocialLinks {
   }
 }
 
-/** Serialise `socials` for storage, dropping empty entries so `{}` is canonical. */
+/**
+ * Serialise `socials` for storage, dropping empty AND invalid entries so `{}`
+ * is canonical and every stored value is safe to render as an `href`.
+ */
 export function serializeSocials(socials: SocialLinks | null | undefined): string {
   const out: SocialLinks = {};
   for (const key of ['twitter', 'github', 'website'] as const) {
     const value = socials?.[key];
-    if (typeof value === 'string' && value.trim().length > 0) out[key] = value.trim();
+    if (typeof value === 'string' && isValidSocial(value)) out[key] = value.trim();
   }
   return JSON.stringify(out);
 }
@@ -115,7 +175,7 @@ export async function createUser(input: CreateUserInput): Promise<UserRecord> {
       email: normalizeEmail(input.email),
       passwordHash: input.passwordHash,
       handle: normalizeHandle(input.handle),
-      name: input.name.slice(0, NAME_MAX),
+      name: normalizeName(input.name),
       bio: input.bio?.slice(0, BIO_MAX) ?? null,
       avatarPath: input.avatarPath ?? null,
       coverPath: input.coverPath ?? null,
@@ -159,7 +219,7 @@ export interface UpdateUserInput {
 /** The write path SPEC-010's `updateProfile` action funnels through. */
 export async function updateUser(id: string, patch: UpdateUserInput): Promise<UserRecord> {
   const data: Prisma.UserUpdateInput = {};
-  if (patch.name !== undefined) data.name = patch.name.slice(0, NAME_MAX);
+  if (patch.name !== undefined) data.name = normalizeName(patch.name);
   if (patch.handle !== undefined) data.handle = normalizeHandle(patch.handle);
   if (patch.bio !== undefined) data.bio = patch.bio === null ? null : patch.bio.slice(0, BIO_MAX);
   if (patch.avatarPath !== undefined) data.avatarPath = patch.avatarPath;

@@ -122,11 +122,20 @@ export async function detachTag(articleId: string, tagId: string): Promise<void>
  * half-applying and throwing partway through.
  */
 export async function setArticleTags(articleId: string, tagNames: string[]): Promise<Tag[]> {
-  const slugs = [...new Set(tagNames.map(normalizeTagSlug))];
-  if (slugs.length > MAX_TAGS_PER_ARTICLE) throw new TooManyTagsError(articleId);
+  // Deduplicate by slug but keep the ORIGINAL name for each survivor. Passing
+  // the slug to `upsertTag` instead would mean a tag first created through this
+  // path is displayed as "design-systems" while the same tag created through
+  // `attachTag` is displayed as "Design Systems" — one tag, two labels,
+  // depending on which write path happened to reach it first.
+  const bySlug = new Map<string, string>();
+  for (const name of tagNames) {
+    const slug = normalizeTagSlug(name);
+    if (!bySlug.has(slug)) bySlug.set(slug, name);
+  }
+  if (bySlug.size > MAX_TAGS_PER_ARTICLE) throw new TooManyTagsError(articleId);
 
   const tags: Tag[] = [];
-  for (const slug of slugs) tags.push(await upsertTag(slug));
+  for (const name of bySlug.values()) tags.push(await upsertTag(name));
 
   await getDb().articleTag.deleteMany({ where: { articleId } });
   if (tags.length > 0) {

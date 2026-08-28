@@ -150,4 +150,25 @@ describe('SPEC-004 — tag slugs are canonical', () => {
     await setArticleTags(articleId, []);
     expect(await listTagsForArticle(articleId)).toEqual([]);
   });
+
+  it('stores the display name, not the slug, so both write paths agree on the label', async () => {
+    // Regression: this path used to hand the normalized slug to `upsertTag`, so
+    // a tag first created here read "design-systems" while the same tag created
+    // via `attachTag` read "Design Systems". One tag, two labels, decided by
+    // whichever write happened to be first.
+    const set = await setArticleTags(articleId, ['Design Systems']);
+    expect(set).toHaveLength(1);
+    expect(set[0]?.slug).toBe('design-systems');
+    expect(set[0]?.name).toBe('Design Systems');
+
+    const viaAttach = await attachTag(articleId, 'Design Systems');
+    expect(viaAttach.id).toBe(set[0]?.id);
+    expect(viaAttach.name).toBe('Design Systems');
+  });
+
+  it('keeps the first spelling when a set repeats one tag in different cases', async () => {
+    const tags = await setArticleTags(articleId, ['Design', 'design']);
+    expect(tags).toHaveLength(1);
+    expect(tags[0]?.name).toBe('Design');
+  });
 });

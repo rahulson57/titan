@@ -50,6 +50,47 @@ export class InvalidStatusError extends Error {
   }
 }
 
+/** SPEC-004's title is "1–120 chars"; this is the 1. */
+export class EmptyTitleError extends Error {
+  constructor() {
+    super('article title must not be empty');
+    this.name = 'EmptyTitleError';
+  }
+}
+
+/**
+ * Thrown when a write would move `bodyJson` without the matching `bodyHtml`.
+ *
+ * SPEC-004 lists `bodyHtml` as derived from `bodyJson` and "regenerated on
+ * every save". `bodyText` and `readingMinutes` are recomputed here, so they
+ * cannot drift — but `bodyHtml` needs SPEC-007's closed ProseMirror schema and
+ * is therefore passed in. Without this guard the two halves come apart
+ * silently: the article's text and read-time advance while the rendered HTML
+ * the reading page actually serves stays on the previous revision, and nothing
+ * fails. The type union below makes that unrepresentable for typed callers;
+ * this error catches the untyped ones (a route handler forwarding parsed JSON).
+ */
+export class DerivedBodyMismatchError extends Error {
+  constructor() {
+    super('bodyJson and bodyHtml must be written together — bodyHtml is derived from bodyJson');
+    this.name = 'DerivedBodyMismatchError';
+  }
+}
+
+/**
+ * Trim, then enforce SPEC-004's "title, 1–120 chars".
+ *
+ * Same split as `normalizeName`: over-long truncates, empty throws. Empty is
+ * not merely untidy here — `buildSlug('')` yields `untitled-<suffix>`, so an
+ * empty title silently mints a real, permanent URL for an article that has no
+ * name, and the slug is frozen the moment it publishes.
+ */
+export function normalizeTitle(title: string): string {
+  const trimmed = title.trim();
+  if (trimmed.length === 0) throw new EmptyTitleError();
+  return trimmed.slice(0, TITLE_MAX);
+}
+
 /**
  * `kebab(title)` — the human-readable half of a slug.
  *
@@ -129,7 +170,7 @@ export async function createArticle(input: WriteArticleInput): Promise<ArticleRe
 
   const id = input.id ?? createId();
   const now = input.now ?? new Date();
-  const title = input.title.slice(0, TITLE_MAX);
+  const title = normalizeTitle(input.title);
   const derived = deriveReading(input.bodyJson);
 
   const row = await getDb().article.create({
@@ -154,14 +195,25 @@ export async function createArticle(input: WriteArticleInput): Promise<ArticleRe
   return toRecord(row);
 }
 
-export interface UpdateArticleInput {
+interface UpdateArticleFields {
   title?: string;
   subtitle?: string | null;
-  bodyJson?: ProseMirrorNode;
-  bodyHtml?: string;
   coverPath?: string | null;
   now?: Date;
 }
+
+/**
+ * A patch either leaves the document alone or replaces it wholesale — there is
+ * no third case in which `bodyJson` and `bodyHtml` move independently. Encoding
+ * that as a union rather than two optional fields means the common mistake
+ * (autosave sends the new doc, forgets the re-render) is a compile error at the
+ * call site instead of a stale cache discovered on the reading page.
+ */
+export type UpdateArticleInput = UpdateArticleFields &
+  (
+    | { bodyJson: ProseMirrorNode; bodyHtml: string }
+    | { bodyJson?: undefined; bodyHtml?: undefined }
+  );
 
 /**
  * The autosave write path. Bumps `version` on every save so SPEC-007's
@@ -176,6 +228,12 @@ export async function updateArticle(
   id: string,
   patch: UpdateArticleInput,
 ): Promise<ArticleRecord> {
+  // Checked before the read: an ill-formed patch is a caller bug, and failing
+  // on it should not depend on whether the article happens to exist.
+  if ((patch.bodyJson === undefined) !== (patch.bodyHtml === undefined)) {
+    throw new DerivedBodyMismatchError();
+  }
+
   const existing = await getDb().article.findUnique({ where: { id } });
   if (!existing) throw new ArticleNotFoundError(`id ${id}`);
 
@@ -183,7 +241,7 @@ export async function updateArticle(
   const data: Prisma.ArticleUpdateInput = { updatedAt: now, version: { increment: 1 } };
 
   if (patch.title !== undefined) {
-    const title = patch.title.slice(0, TITLE_MAX);
+    const title = normalizeTitle(patch.title);
     data.title = title;
     if (existing.publishedAt === null) data.slug = buildSlug(title, existing.id);
   }

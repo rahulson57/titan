@@ -83,6 +83,13 @@ export async function incrementClap(
   by = 1,
   now: Date = new Date(),
 ): Promise<Clap> {
+  // NOTE (flagged to TASK-009, not changed here): with no existing row, `by <= 0`
+  // floors up to MIN_CLAPS_PER_READER and CREATES a 1-clap row — a call meaning
+  // "add nothing" registers a clap. That is deliberate as it stands: the test
+  // "treats a nonsense increment as at least one clap, never zero rows" pins it,
+  // and clap interaction semantics are SPEC-009's, not SPEC-004's. SPEC-004 only
+  // requires count ∈ 1..50 and one row per (user, article), both of which hold
+  // either way. Left as-is rather than reversed inside this slice.
   const existing = await getDb().clap.findUnique({
     where: { userId_articleId: { userId, articleId } },
   });
