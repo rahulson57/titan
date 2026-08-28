@@ -14,9 +14,11 @@
  *  - **"keeping its row"** — verifiable NOW, and asserted unconditionally
  *    below. It is also the clause most worth pinning, because the tempting
  *    implementation of "remove from the feed" is a delete.
- *  - **"removes from the home feed"** — `app/page.tsx` is still S01's
- *    placeholder; the ranked feed is SPEC-008 (TASK-007, Feed & Search). There
- *    is no feed to disappear from yet.
+ *  - **"removes from the home feed"** — ARMED since TASK-007 (SPEC-008)
+ *    landed the ranked feed. Guarded on the feed's own `data-testid` rather
+ *    than on the absence of a placeholder, and the guard is itself under test
+ *    at the bottom of this file. See TASK-022 for why that stopped being
+ *    optional.
  *  - **"and from FTS results"** — `article_fts` exists (the initial migration
  *    creates the virtual table) but its write TRIGGERS are owned by SPEC-008
  *    too, and the migration says so in its own comment. Nothing in this slice
@@ -31,6 +33,15 @@
  * when it lands and need no edit to this file. This is the shape
  * `tests/e2e/draft-privacy.spec.ts` established and `tests/helpers/db.ts` calls
  * a capability probe.
+ *
+ * ── Amended by TASK-022 ───────────────────────────────────────────────────
+ * The self-arming property above is only as good as what the guard is keyed
+ * on, and one of these two was keyed on the wrong thing — it disarmed itself
+ * again, in silence, months after the slice it was waiting for had landed.
+ * A guard now keys on the CONTRACT the test consumes, and a guard-integrity
+ * test at the bottom of this file fails loudly if one is disarmed while the
+ * thing it waits for is present. An armed-but-skipped test that nobody can see
+ * skipping is indistinguishable from a test that does not exist.
  */
 
 import { expect, test, type Page } from '@playwright/test';
@@ -47,17 +58,51 @@ import { MIN_BODY_TEXT_CHARS } from '../../lib/content/publish';
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 /**
- * True once SPEC-008 has landed a home feed.
+ * The id the home feed publishes as its contract — and the id this suite
+ * queries when it asserts a withdrawn article is gone from `/`.
  *
- * Checked as "the placeholder is gone" rather than "the file exists":
- * `app/page.tsx` is present today as S01's boot placeholder, which says so in
- * its own header. Probing for the file would arm this suite against a page that
- * renders no articles at all, and it would pass for entirely the wrong reason.
+ * Named once, deliberately: the guard below and the assertion in the test must
+ * agree about what "the home feed" is. A guard that arms on one identifier
+ * while the test looks for another is how a suite goes green against a page it
+ * never actually reached.
  */
-function hasHomeFeed(): boolean {
+const HOME_FEED_TESTID = 'home-feed';
+
+/** `app/page.tsx` as it stands on disk, or `null` if it is not there at all. */
+function homePageSource(): string | null {
   const page = join(REPO_ROOT, 'app', 'page.tsx');
-  if (!existsSync(page)) return false;
-  return !readFileSync(page, 'utf8').includes('PLACEHOLDER');
+  return existsSync(page) ? readFileSync(page, 'utf8') : null;
+}
+
+/**
+ * ── Repaired by TASK-022 (operator-filed from the 18:42 audit) ─────────────
+ *
+ * True once a real home feed is built, checked POSITIVELY: does `app/page.tsx`
+ * render the one thing the assertion below needs in order to be answerable at
+ * all, `data-testid="home-feed"`?
+ *
+ * What it used to be, and why that failed. The predicate was
+ * `!source.includes('PLACEHOLDER')` — "S01's boot placeholder is gone". It was
+ * correct when written and it armed correctly when SPEC-008 landed. TASK-018
+ * then added a loading skeleton containing `const PLACEHOLDER_ROWS`, and the
+ * guard silently flipped back to false: from 16:31 the SPEC-007 withdrawal
+ * test skipped, on a fully built feed, for a reason with nothing to do with
+ * the feed. The two tasks share no file, so no reviewer of either diff could
+ * have seen it — and the suite stayed green the whole time, because a test
+ * that does not run cannot fail.
+ *
+ * The class matters more than the instance. A guard keyed on INCIDENTAL file
+ * content is disarmed by any later edit that merely mentions the word. A guard
+ * keyed on the CONTRACT the test consumes can only be disarmed by removing
+ * that contract — a change this file should notice, and one the guard
+ * integrity test at the bottom makes it notice loudly instead of quietly.
+ *
+ * `source` is a parameter so the predicate can be exercised against mutated
+ * text without touching the repo — see 'the home-feed guard is armed today,
+ * and can still fail'.
+ */
+function hasHomeFeed(source: string | null = homePageSource()): boolean {
+  return source !== null && source.includes(`data-testid="${HOME_FEED_TESTID}"`);
 }
 
 /** True once SPEC-008's triggers maintain `article_fts`. */
@@ -69,13 +114,21 @@ async function hasFtsTriggers(): Promise<boolean> {
 }
 
 const WAITING_ON_FEED =
-  'waiting on TASK-007 (SPEC-008): app/page.tsx is still S01’s boot placeholder, so there is ' +
-  'no ranked home feed for an unpublished article to disappear from.';
+  `app/page.tsx does not render data-testid="${HOME_FEED_TESTID}", so there is no home feed for ` +
+  'a withdrawn article to disappear from. This guard is ARMED as of TASK-022 — if you are reading ' +
+  'this as a live skip reason, the feed contract was removed or renamed, and the guard-integrity ' +
+  'test at the bottom of this file will have gone red alongside it. Fix the feed or update ' +
+  'HOME_FEED_TESTID; do not delete either check.';
 
 const WAITING_ON_FTS =
-  'waiting on TASK-007 (SPEC-008): article_fts exists but its write triggers do not. The ' +
-  'initial migration states that those triggers are SPEC-008’s, and they key off ' +
-  'Article.status — so this arms itself the moment they land.';
+  'no write triggers on "Article" yet, so nothing maintains article_fts. NOTE (TASK-022, message ' +
+  'only — the predicate is unchanged): TASK-007 landed these triggers, but lib/search/fts.ts ' +
+  'installs them LAZILY on the first call into the search module, not in a migration. `npm test` ' +
+  'runs vitest before playwright and the unit search suites install them, so this arms in the ' +
+  'gate; running `playwright test` on this file ALONE skips it, because nothing has searched yet. ' +
+  'That is a property of where the DDL lives, not a missing slice — do not read this as ' +
+  '“SPEC-008 has not landed”. Raised with the coordinator rather than repaired here: the fix is ' +
+  'in lib/search/fts.ts or prisma/migrations/, neither of which is this task’s scope.';
 
 const createdEmails: string[] = [];
 
@@ -319,9 +372,20 @@ test.describe('SPEC-007 — publishing', () => {
     await expect(page.getByTestId('article-status')).toHaveText('Draft', { timeout: 15_000 });
 
     await page.goto('/tag/craft');
+    // Prove we are looking at the tag page before concluding the article is not
+    // on it. `toHaveCount(0)` is satisfied by a 404, an error boundary or a
+    // redirect exactly as happily as by a correct withdrawal — the absence half
+    // of this criterion is only worth anything if the page is known to be the
+    // right one. The `toHaveCount(1)` above establishes that for the published
+    // case; nothing established it for the withdrawn one.
+    await expect(page.getByTestId('tag-page')).toBeVisible();
     await expect(page.locator(link)).toHaveCount(0);
 
     await page.goto('/');
+    // The positive check the guard is now keyed on, asserted at runtime as well
+    // as statically: the guard reads `app/page.tsx`, and the only thing that
+    // proves the built page agrees with its source is querying the id here.
+    await expect(page.getByTestId(HOME_FEED_TESTID)).toBeVisible();
     await expect(page.locator(link)).toHaveCount(0);
   });
 
@@ -375,5 +439,85 @@ test.describe('SPEC-007 — publishing', () => {
     expect(await inIndex()).toBe(0);
     // Still a row, though — the criterion asks for both halves at once.
     expect(await getArticleById(articleId)).not.toBeNull();
+  });
+});
+
+/**
+ * ── The guard, under test (TASK-022) ──────────────────────────────────────
+ *
+ * A skip guard is code, and nothing in this repo tested one until now. The
+ * home-feed guard above was wrong for over two hours and the suite stayed
+ * green throughout, because the only thing it broke was a test's ability to
+ * run — and an unrun test reports nothing at all. These assertions are the
+ * smallest thing that would have caught it:
+ *
+ *   1. it is ARMED right now. This is the backstop. If the feed's contract is
+ *      renamed or deleted, THIS goes red, instead of the withdrawal test going
+ *      quiet. Making disarmament noisy is the entire point.
+ *   2. it CAN still fail. A predicate that returns true for every input would
+ *      satisfy (1) forever while guarding nothing, which is the failure mode
+ *      (1) alone cannot distinguish from success.
+ *   3. it is IMMUNE to the collision that broke it. The old predicate is
+ *      written out beside the new one and both are run against the same
+ *      synthetic source, so the regression is demonstrated rather than
+ *      asserted — a reader can see the old one return the wrong answer.
+ *
+ * Fixtures are synthetic, not the real `app/page.tsx`, everywhere except (1).
+ * Pinning a mutation proof to today's incidental file contents would recreate
+ * the bug being fixed, one file over.
+ *
+ * Deliberately NOT behind `appIsBootable()`: these are pure assertions about
+ * text, they need no browser and no database, and a guard-integrity check that
+ * can itself be skipped is self-defeating.
+ */
+test.describe('SPEC-007 — the home-feed guard is itself load-bearing', () => {
+  test('the home-feed guard is armed today, and can still fail', () => {
+    const source = homePageSource();
+    if (source === null) {
+      throw new Error('app/page.tsx is absent — there is no home feed contract to guard on.');
+    }
+
+    // (1) ARMED. The assertion that goes red in place of a silent skip.
+    expect(
+      hasHomeFeed(source),
+      `app/page.tsx no longer renders data-testid="${HOME_FEED_TESTID}", so the withdrawal test ` +
+        'in this file would skip rather than fail. Restore the id on the feed container, or ' +
+        'update HOME_FEED_TESTID to follow it — do not delete this check.',
+    ).toBe(true);
+
+    // (2) CAN FAIL — three distinct ways the contract can actually break.
+    expect(hasHomeFeed(null), 'no app/page.tsx at all must not arm the guard').toBe(false);
+    expect(
+      hasHomeFeed('export default function Home() {\n  return <main />;\n}\n'),
+      'a home page with no feed container must not arm the guard',
+    ).toBe(false);
+    expect(
+      hasHomeFeed(source.replace(`data-testid="${HOME_FEED_TESTID}"`, 'data-testid="feed"')),
+      'renaming the id out from under the test must not arm the guard',
+    ).toBe(false);
+
+    // (3) THE COLLISION, replayed. `legacyGuard` is the predicate this task
+    // removed, verbatim; `feedWithSkeleton` is the shape TASK-018 introduced —
+    // a real, complete feed that also happens to contain the word.
+    const legacyGuard = (text: string) => !text.includes('PLACEHOLDER');
+    const feedWithSkeleton =
+      'const PLACEHOLDER_ROWS = [0, 1, 2];\n' +
+      'export default function Home() {\n' +
+      `  return <main data-testid="${HOME_FEED_TESTID}" />;\n` +
+      '}\n';
+
+    expect(
+      legacyGuard(feedWithSkeleton),
+      'this is the defect: the old guard reads a built feed as "not built yet"',
+    ).toBe(false);
+    expect(
+      hasHomeFeed(feedWithSkeleton),
+      'the repaired guard must stay armed through an unrelated PLACEHOLDER mention',
+    ).toBe(true);
+
+    // The two predicates must not merely differ here — they must differ FOR
+    // THIS REASON. Strip the incidental mention and the old one arms again,
+    // which is what makes the collision the cause rather than a coincidence.
+    expect(legacyGuard(feedWithSkeleton.replace('PLACEHOLDER_ROWS', 'SKELETON_ROWS'))).toBe(true);
   });
 });
