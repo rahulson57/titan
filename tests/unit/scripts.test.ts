@@ -290,7 +290,7 @@ describe('SPEC-002 — no guard can hide once its dependency lands', () => {
  * provider is. Pinning both to the same exact version is what keeps the two
  * halves in step regardless of which copy of the core gets invoked.
  *
- * Exact versions, not ranges: `^3.2.4` on both sides still permits an install
+ * Exact versions, not ranges: `^3.2.7` on both sides still permits an install
  * that resolves the two packages to different minors.
  */
 describe('SPEC-002 — the runner cannot be assembled from mismatched halves', () => {
