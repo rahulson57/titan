@@ -292,10 +292,39 @@ describe('SPEC-005 — profile and upload ownership', () => {
   });
 
   it('only the owning user may upload under their own path', () => {
-    expect(ownsUploadPath(owner, 'public/uploads/user-1/avatar.webp')).toBe(true);
-    expect(ownsUploadPath(owner, '/uploads/user-1/cover.webp')).toBe(true);
-    expect(ownsUploadPath(owner, 'public/uploads/user-2/avatar.webp')).toBe(false);
-    expect(ownsUploadPath(null, 'public/uploads/user-1/avatar.webp')).toBe(false);
+    // The layout is SPEC-006's storage table verbatim -- `<kind>/<userId>/`,
+    // kind FIRST. These assertions previously used `/uploads/<userId>/...`,
+    // a shape the product has never emitted, which is precisely why they
+    // stayed green while the function read the wrong segment (TASK-015).
+    expect(ownsUploadPath(owner, 'public/uploads/avatars/user-1/abc.webp')).toBe(true);
+    expect(ownsUploadPath(owner, '/uploads/covers/user-1/abc.webp')).toBe(true);
+    expect(ownsUploadPath(owner, '/uploads/inline/user-1/abc.webp')).toBe(true);
+
+    expect(ownsUploadPath(owner, 'public/uploads/avatars/user-2/abc.webp')).toBe(false);
+    expect(ownsUploadPath(null, 'public/uploads/avatars/user-1/abc.webp')).toBe(false);
+  });
+
+  it('rejects a path with no kind segment, whatever id it claims', () => {
+    // The shape the old assertions pinned. It is not a path the uploader can
+    // produce, so treating it as owned would mean honouring a layout nothing
+    // writes -- and would re-open the door to reading an id out of a slot
+    // that holds something else.
+    expect(ownsUploadPath(owner, 'public/uploads/user-1/avatar.webp')).toBe(false);
+    expect(ownsUploadPath(owner, '/uploads/user-1/cover.webp')).toBe(false);
+
+    // Nor is an unrecognised kind waved through on the strength of the id
+    // sitting in the right slot.
+    expect(ownsUploadPath(owner, '/uploads/thumbnails/user-1/abc.webp')).toBe(false);
+  });
+
+  it('refuses the seed tree, which is shared fixture data and has no owner', () => {
+    // SPEC-006's table lists `public/uploads/seed/**` alongside the three
+    // per-user kinds, but it is flat and tracked in git -- there is no
+    // `<userId>` level to read. Position 2 there is a filename, so admitting
+    // `seed` as a kind would hand a user ownership of repo assets the moment
+    // one happened to be named after them.
+    expect(ownsUploadPath(owner, 'public/uploads/seed/avatar-a.webp')).toBe(false);
+    expect(ownsUploadPath(owner, 'public/uploads/seed/user-1/avatar-a.webp')).toBe(false);
   });
 
   it('rejects traversal that names another user and lands in your own directory', () => {
@@ -303,14 +332,41 @@ describe('SPEC-005 — profile and upload ownership', () => {
     // `user-2`'s segment while resolving inside `user-1`'s. Rejecting `..`
     // outright keeps the authorization decision and the filesystem's view of
     // the path from disagreeing.
-    expect(ownsUploadPath(owner, 'public/uploads/user-2/../user-1/a.webp')).toBe(false);
-    expect(ownsUploadPath(owner, 'public/uploads/user-1/../user-2/a.webp')).toBe(false);
-    expect(ownsUploadPath(owner, 'public\\uploads\\user-2\\..\\user-1\\a.webp')).toBe(false);
+    //
+    // These carry a real `<kind>` segment on purpose. Without one they would
+    // now be rejected for having no kind before the `..` check ever mattered,
+    // and would pass while proving nothing about traversal.
+    expect(ownsUploadPath(owner, 'public/uploads/avatars/user-2/../user-1/a.webp')).toBe(false);
+    expect(ownsUploadPath(owner, 'public/uploads/avatars/user-1/../user-2/a.webp')).toBe(false);
+    expect(
+      ownsUploadPath(owner, 'public\\uploads\\avatars\\user-2\\..\\user-1\\a.webp'),
+    ).toBe(false);
+
+    // The traversal rejection is unconditional, not a side effect of the
+    // owner comparison: this one resolves to the caller's OWN directory and
+    // is still refused.
+    expect(ownsUploadPath(owner, 'public/uploads/avatars/user-1/../../avatars/user-1/a.webp')).toBe(
+      false,
+    );
   });
 
   it('rejects a path with no uploads segment at all', () => {
-    expect(ownsUploadPath(owner, 'public/user-1/avatar.webp')).toBe(false);
+    expect(ownsUploadPath(owner, 'public/avatars/user-1/avatar.webp')).toBe(false);
     expect(ownsUploadPath(owner, '')).toBe(false);
+  });
+
+  it('rejects a truncated path that stops before the user id', () => {
+    // `segments[uploadsAt + 2]` is undefined here; the comparison must answer
+    // false rather than throw or coerce.
+    expect(ownsUploadPath(owner, '/uploads')).toBe(false);
+    expect(ownsUploadPath(owner, '/uploads/avatars')).toBe(false);
+    expect(ownsUploadPath(owner, '/uploads/avatars/')).toBe(false);
+  });
+
+  it('recognises the user own directory, not just files inside it', () => {
+    // The guard is asked about a destination before a filename exists.
+    expect(ownsUploadPath(owner, '/uploads/avatars/user-1')).toBe(true);
+    expect(ownsUploadPath(owner, '/uploads/avatars/user-1/')).toBe(true);
   });
 });
 

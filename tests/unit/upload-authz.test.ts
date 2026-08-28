@@ -31,14 +31,19 @@
  * step differs (sign in vs. stop).
  *
  * -- On `ownsUploadPath` -----------------------------------------------------
- * `lib/auth/session.ts` (SPEC-005, TASK-004) exports `ownsUploadPath`, and it
- * is deliberately NOT used here. Its tests pin it to a `/uploads/<userId>/...`
- * layout, whereas SPEC-006's storage table is `/uploads/<kind>/<userId>/...` --
- * so against a real stored path it reads the KIND segment where it expects the
- * user id and returns false for every legitimate upload. That mismatch is
- * recorded in this slice's proposal; the rule it encodes is enforced here
- * directly, and the last assertion below documents the discrepancy so it cannot
- * be discovered by accident later.
+ * `lib/auth/session.ts` (SPEC-005, TASK-004) exports `ownsUploadPath`. When
+ * this slice landed it read the KIND segment where SPEC-006's storage table
+ * puts the user id -- `/uploads/<kind>/<userId>/...` -- and so answered false
+ * for the owner of every upload the product emits. TASK-015 repaired it, and
+ * the last describe block below now pins the repaired behaviour against a real
+ * stored path.
+ *
+ * The handler still enforces ownership DIRECTLY rather than delegating to the
+ * helper, and that is not an oversight left over from the bug. The two guard
+ * different things: the helper answers "does this existing path belong to this
+ * user", while the handler must reject a mismatched `userId` field BEFORE any
+ * path exists to ask about (DEC-034). Rewiring the handler onto the helper is
+ * out of scope here and would not be a simplification.
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
@@ -222,26 +227,49 @@ describe('SPEC-005/006 - absent and mismatched are different answers', () => {
   });
 });
 
-describe('SPEC-005 - ownsUploadPath and the SPEC-006 layout disagree', () => {
-  it('reads the kind segment where it expects the user id', () => {
-    // Documented, not worked around. `ownsUploadPath` was written for a
-    // `/uploads/<userId>/...` layout (see tests/unit/authz-article.test.ts,
-    // TASK-004's file) and SPEC-006's storage table interposes a kind segment.
-    // Against a real stored path it therefore answers false for the owner --
-    // which is why this slice enforces ownership directly instead of calling
-    // it, and why a later slice must not "fix" the uploader by adopting it.
+describe('SPEC-005/006 - ownsUploadPath agrees with the storage layout', () => {
+  it('recognises the owner of a real stored path', () => {
+    // The assertion this replaces pinned the OPPOSITE result. It was correct
+    // when it was written -- the helper read `segments[uploadsAt + 1]`, the
+    // kind, and compared 'avatars' to a cuid2 -- and it was deliberately left
+    // failing-by-design so the repair could not land silently. TASK-015 moved
+    // the read to `segments[uploadsAt + 2]`, so the owner of a path this slice
+    // actually writes is now recognised.
     const realStoredPath = `/uploads/avatars/${ALICE.id}/abcdefghijklmnopqrstuvwx.webp`;
-    expect(ownsUploadPath(ALICE, realStoredPath)).toBe(false);
+    expect(ownsUploadPath(ALICE, realStoredPath)).toBe(true);
+    expect(ownsUploadPath(BOB, realStoredPath)).toBe(false);
 
-    // It behaves as its own tests describe on the layout it was written for.
-    expect(ownsUploadPath(ALICE, `/uploads/${ALICE.id}/x.webp`)).toBe(true);
-    expect(ownsUploadPath(ALICE, `/uploads/${BOB.id}/x.webp`)).toBe(false);
+    // All three per-user kinds, since the helper now validates the kind rather
+    // than stepping over it.
+    for (const kind of ['avatars', 'covers', 'inline']) {
+      expect(ownsUploadPath(ALICE, `/uploads/${kind}/${ALICE.id}/x.webp`)).toBe(true);
+      expect(ownsUploadPath(BOB, `/uploads/${kind}/${ALICE.id}/x.webp`)).toBe(false);
+    }
+
+    // And the layout it was mistakenly written for is no longer honoured --
+    // the uploader has never emitted a path shaped like this.
+    expect(ownsUploadPath(ALICE, `/uploads/${ALICE.id}/x.webp`)).toBe(false);
   });
 
-  it('the property it stands for is enforced anyway, by the handler', async () => {
-    // The point of the test above is not that the helper is broken in a way
-    // that matters today - it is that the guarantee is not currently coming
-    // from it. This is where the guarantee comes from.
+  it('answers about the path the handler actually wrote', async () => {
+    // Closing the loop end to end: take the path this slice's own uploader
+    // returns and hand it straight to the helper. This is the assertion that
+    // would have caught the original defect, because it never names a layout
+    // -- it asks the writer where the file went and asks the guard who owns
+    // it. If the two ever disagree again, this goes red first.
+    const response = await handleUpload(await upload({ kind: 'avatar' }), ALICE);
+    expect(response.status).toBe(201);
+
+    const body = (await response.json()) as { path: string };
+    expect(ownsUploadPath(ALICE, body.path)).toBe(true);
+    expect(ownsUploadPath(BOB, body.path)).toBe(false);
+  });
+
+  it('the handler enforces the same property independently', async () => {
+    // Unchanged in intent from what this slice landed. The helper being
+    // correct does not make this redundant: the handler rejects a mismatched
+    // `userId` field before a path exists (DEC-034), which is a check the
+    // helper is not positioned to make.
     const response = await handleUpload(
       await upload({ kind: 'avatar', userId: BOB.id }),
       ALICE,
