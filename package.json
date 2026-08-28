@@ -18,6 +18,7 @@
     "test:coverage": "vitest run --coverage",
     "db:migrate": "prisma migrate deploy",
     "db:seed": "tsx prisma/seed.ts",
+    "search:reindex": "tsx scripts/search-reindex.mjs",
     "uploads:seed": "node scripts/uploads-seed.mjs",
     "uploads:gc": "node scripts/uploads-gc.mjs"
   },
