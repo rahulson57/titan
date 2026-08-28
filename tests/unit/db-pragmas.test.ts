@@ -18,11 +18,15 @@
  * moment it does; they need no edit to start running.
  */
 
+import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, rmSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import {
   createTestDatabase,
   hasDbClient,
   hasMigratableSchema,
+  REPO_ROOT,
   type TestDatabase,
 } from '../helpers/db';
 
@@ -88,13 +92,112 @@ describe.skipIf(!READY)(`SPEC-001 — the app connection runs in WAL mode${READY
   });
 });
 
+/** The `DATABASE_URL="..."` value declared in a repo-root env file, or undefined. */
+function declaredDatabaseUrl(file: string): string | undefined {
+  return /^DATABASE_URL="(.+)"$/m.exec(readFileSync(join(REPO_ROOT, file), 'utf8'))?.[1];
+}
+
+/** Delete a sqlite file and its sidecars, wherever it turned out to land. */
+function removeDatabase(path: string): void {
+  for (const suffix of ['', '-wal', '-shm', '-journal']) {
+    rmSync(`${path}${suffix}`, { force: true });
+  }
+}
+
 describe('SPEC-001 — the database location is a local file either way', () => {
-  // Asserts against configuration rather than a connection, so it holds now.
-  it('points DATABASE_URL at a file: URL under ./data/', async () => {
-    const { readFileSync } = await import('node:fs');
-    const example = readFileSync(new URL('../../.env.example', import.meta.url), 'utf8');
-    const match = /^DATABASE_URL="(.+)"$/m.exec(example);
-    expect(match?.[1]).toBe('file:./data/titan.db');
+  /**
+   * Where the configured DATABASE_URL actually puts the database.
+   *
+   * This test used to read `.env.example` and assert the string was
+   * `file:./data/titan.db`. It was green for four slices while the database sat
+   * in `prisma/data/` (TASK-016), because a relative sqlite `file:` URL is
+   * resolved against the directory holding `schema.prisma` — so the string that
+   * reads as "the repo root" means `prisma/`. Its own comment said the quiet
+   * part out loud: "asserts against configuration rather than a connection, so
+   * it holds now."
+   *
+   * Swapping in a corrected literal would repeat exactly that defect, so this
+   * asserts the RESOLVED location instead: run the real migration through the
+   * real Prisma CLI at the configured path, then look at where the file landed.
+   * `tests/unit/constraints.test.ts` proves the same claim statically from the
+   * other end; this one is the empirical half and would catch a change in how
+   * Prisma resolves, which no amount of string-matching can.
+   *
+   * Only the FILENAME is substituted — the directory prefix under test is the
+   * committed one, character for character. Migrating `titan.db` itself is
+   * forbidden by SPEC-002 and would defeat the purpose anyway.
+   */
+  it.skipIf(!READY)(
+    `migrates to a file under ./data/, not prisma/data/${READY ? '' : ` [${REASON}]`}`,
+    () => {
+      const configured = declaredDatabaseUrl('.env');
+      expect(
+        configured,
+        '.env must declare DATABASE_URL — it is the file the Prisma CLI reads (DEC-013)',
+      ).toBeTruthy();
+
+      // e.g. `file:../data/titan.db` -> prefix `file:../data/`, which is the
+      // part this test is actually interrogating.
+      const prefix = (configured as string).replace(/[^/]+$/, '');
+      const name = `test-${process.pid}-resolve.db`;
+
+      // Belt and braces against SPEC-002's "never against ./data/titan.db":
+      // the substitution above cannot produce titan.db, and this proves it.
+      expect(`${prefix}${name}`).not.toContain('titan.db');
+
+      const landed = join(REPO_ROOT, 'data', name);
+      const legacy = join(REPO_ROOT, 'prisma', 'data', name);
+      removeDatabase(landed);
+      removeDatabase(legacy);
+
+      try {
+        execFileSync(
+          process.platform === 'win32' ? 'npx.cmd' : 'npx',
+          ['prisma', 'migrate', 'deploy'],
+          {
+            cwd: REPO_ROOT,
+            stdio: 'ignore',
+            env: { ...process.env, DATABASE_URL: `${prefix}${name}` },
+            shell: process.platform === 'win32',
+          },
+        );
+
+        expect(
+          existsSync(landed),
+          `DATABASE_URL="${configured}" did not migrate to ./data/. A relative ` +
+            'sqlite path is resolved against prisma/, not the repository root, ' +
+            'so it needs to climb out: file:../data/titan.db.',
+        ).toBe(true);
+        expect(
+          existsSync(legacy),
+          'the database landed in prisma/data/ — this is the TASK-016 defect, ' +
+            'not a new one. SPEC-001 puts persistent state at ./data/.',
+        ).toBe(false);
+      } finally {
+        removeDatabase(landed);
+        removeDatabase(legacy);
+      }
+    },
+  );
+
+  it('serves the same database the CLI migrates', async () => {
+    // DEC-013: the app's fallback and the CLI's `.env` must name ONE file.
+    // If they drift, one database gets migrated and a different one served,
+    // with no error to announce it — and `tests/e2e/auth.spec.ts` counts
+    // session rows through the fallback while the dev server uses `.env`.
+    // Compared as resolved paths rather than strings, because equal strings
+    // are not what this needs to be true.
+    const { DEFAULT_DATABASE_URL } = await import('../../lib/db/client');
+    const schemaDir = join(REPO_ROOT, 'prisma');
+    const resolveUrl = (url: string) => resolve(schemaDir, url.replace(/^file:/, ''));
+
+    for (const file of ['.env', '.env.example']) {
+      expect(
+        resolveUrl(declaredDatabaseUrl(file) ?? ''),
+        `${file} and lib/db/client.ts DEFAULT_DATABASE_URL name different databases`,
+      ).toBe(resolveUrl(DEFAULT_DATABASE_URL));
+    }
+    expect(resolveUrl(DEFAULT_DATABASE_URL)).toBe(join(REPO_ROOT, 'data', 'titan.db'));
   });
 
   it('never lets a test bind the development database', () => {
