@@ -453,7 +453,12 @@ function sanitizeAny(raw: unknown, depth: number): Sanitized[] {
     return [{ node, group: 'inline' }];
   }
 
-  const spec = NODE_SPECS[type];
+  // Annotated rather than inferred: `as const satisfies` narrows each entry to
+  // its own literal shape, so `dropWhenEmpty` is invisible on the entries that
+  // omit it. Widening to the declared interface is what makes the OPTIONAL
+  // member readable — the alternative is adding `dropWhenEmpty: false` to nine
+  // entries that do not need it.
+  const spec: NodeSpec = NODE_SPECS[type];
   const attrs = nodeAttrs(type, raw.attrs);
   if (!attrs.ok) return [];
 

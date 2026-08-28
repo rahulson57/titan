@@ -40,17 +40,14 @@ import { revalidatePath } from 'next/cache';
 
 import { getArticleById } from '../../lib/db/articles';
 import { auth } from '../../lib/auth/session';
-import {
-  type DraftInput,
-  type SaveDraftResult,
-  createDraftContent,
-  saveDraftContent,
-} from '../../lib/content/autosave';
+import type { DraftInput, SaveDraftResult } from '../../lib/content/autosave';
 import {
   type PublishInput,
   type PublishResult,
+  createDraftContent,
   deleteDraft,
   publishDraft,
+  saveDraftContent,
   unpublishDraft,
 } from '../../lib/content/publish';
 import { guardArticleMutation } from '../../lib/auth/session';

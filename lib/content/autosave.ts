@@ -1,7 +1,36 @@
 /**
- * Autosave — the scheduler and the conflict rule (SPEC-007, "Autosave state
- * machine").
+ * The editor's CLIENT-SAFE half (SPEC-007).
  *
+ * ── Read this before adding an import ─────────────────────────────────────
+ * `components/editor/Editor.tsx`, `SaveIndicator.tsx` and `TagInput.tsx` are
+ * client components and they import this module. Nothing here may import
+ * `lib/db/**`, directly or transitively.
+ *
+ * That is not style. `lib/db/articles.ts` imports `lib/db/ids.ts`, which
+ * imports `node:crypto`, which the browser build cannot resolve — the failure
+ * is `UnhandledSchemeError: Reading from "node:crypto" is not handled by
+ * plugins`, and it takes the whole route down at compile time rather than
+ * degrading. It is also the wrong shape regardless of whether it built: a
+ * client bundle that contains the repository layer contains the SQL, and
+ * SPEC-004's boundary rule ("no module opens its own SQLite handle") means
+ * nothing if the query text ships to the browser.
+ *
+ * So `lib/content/` is split along CLIENT/SERVER, not along autosave/publish:
+ *
+ *  - **this file** — everything the browser needs: the autosave state machine,
+ *    the four indicator strings, the shape of a save request and its reply, and
+ *    the pure guards the form runs for immediate feedback.
+ *  - **`lib/content/publish.ts`** — everything that writes: `saveDraftContent`,
+ *    `createDraftContent`, and the publish transitions. Imports the repository,
+ *    and is reached only from `app/editor/actions.ts` and the unit suites.
+ *
+ * The guards live on this side deliberately. `validatePublish` is a pure
+ * function of three values, the form runs it to show every problem at once
+ * without a round trip, and `publishDraft` runs the SAME function server-side
+ * before it writes anything — so the client's copy is an optimisation and the
+ * server's is the authority, rather than two rules that can disagree.
+ *
+ * ── The autosave state machine (SPEC-007) ─────────────────────────────────
  * ```
  * [*] --> Clean
  * Clean  --> Dirty:  keystroke
@@ -12,41 +41,25 @@
  * Dirty  --> Saving: Cmd/Ctrl+S
  * ```
  *
- * Two halves live here, and they are separated on purpose:
+ * The scheduler takes its clock and timers as a parameter, so
+ * `tests/unit/editor-conflict.test.ts` can drive 35 seconds of continuous
+ * typing — the case SPEC-007's ceiling criterion is about — in under a
+ * millisecond, and can assert "exactly one save" as a counter rather than as a
+ * network observation.
  *
- *  1. `createAutosaveScheduler` — WHEN to save. Pure, with the clock and the
- *     timer injected, so the 2s debounce and the 30s ceiling are unit-testable
- *     without waiting 35 real seconds or watching a browser.
- *  2. `saveDraftContent` — WHAT a save does, including the optimistic
- *     concurrency check. Server-side; the Server Action in
- *     `app/editor/actions.ts` is a thin authenticated wrapper over it.
- *
- * ── Why the conflict check is here and not in `lib/db/articles.ts` ─────────
- * `updateArticle` bumps `version` unconditionally and compares nothing — by
+ * ── Why the conflict rule is not in `lib/db/articles.ts` ──────────────────
+ * `updateArticle` bumps `version` unconditionally and compares nothing, by
  * design: it is the repository's job to make the counter advance on every
- * write, and every write path wants that. The COMPARISON is a policy about
- * what an editor is allowed to overwrite, and it belongs with the editor.
- *
- * The important half of SPEC-007's rule is the negative one — "it never
- * silently overwrites a newer server doc" — so the check runs BEFORE any write
- * and returns without touching the row. `tests/unit/editor-conflict.test.ts`
- * proves the stored `bodyJson` is byte-identical after a rejected save, which
- * is the only assertion that distinguishes this from a check that runs after
- * the update and reports a conflict it already caused.
+ * write, and every write path wants that. The COMPARISON is a policy about what
+ * an editor may overwrite, so it belongs with the editor — in `publish.ts`,
+ * next to the write it guards. `CONFLICT_MESSAGE` and the result types are here
+ * because the client renders them.
  */
-
-import {
-  type ArticleRecord,
-  DerivedBodyMismatchError,
-  EmptyTitleError,
-  createArticle,
-  getArticleById,
-  normalizeTitle,
-  updateArticle,
-} from '../db/articles';
-import { MAX_TAGS_PER_ARTICLE, TooManyTagsError, setArticleTags } from '../db/tags';
-import { deriveContent } from './render';
-import { toProseMirrorNode } from './schema';
+/*
+ * No imports from `lib/db/**`, and that is a load-bearing property rather than
+ * a coincidence — see the header. The only import here is a type.
+ */
+import type { ContentNode } from './schema';
 
 // ---------------------------------------------------------------------------
 // Timing
@@ -261,7 +274,116 @@ export function createAutosaveScheduler<T>(options: AutosaveOptions<T>): Autosav
 }
 
 // ---------------------------------------------------------------------------
-// The save itself
+// The guards
+// ---------------------------------------------------------------------------
+
+/** SPEC-007: "`bodyText` >= 50 chars". */
+export const MIN_BODY_TEXT_CHARS = 50;
+
+/**
+ * SPEC-007: "1-5 tags".
+ *
+ * `MAX_TAGS` is a literal rather than a re-export of `MAX_TAGS_PER_ARTICLE`
+ * from `lib/db/tags.ts`, and that is forced rather than chosen: this module is
+ * imported by `components/editor/TagInput.tsx`, a client component, and
+ * `lib/db/tags.ts` imports `@prisma/client`. Re-exporting the constant would
+ * drag the whole repository layer — and `node:crypto` under it — into the
+ * browser bundle.
+ *
+ * A duplicated number is a real risk, so it is not left to inspection: the
+ * publish-guard suite asserts `MAX_TAGS === MAX_TAGS_PER_ARTICLE` directly. A
+ * test file is bundled by nobody, so it can import both sides and hold them
+ * together.
+ */
+export const MIN_TAGS = 1;
+export const MAX_TAGS = 5;
+
+export type PublishField = 'title' | 'body' | 'tags';
+
+export interface PublishFieldError {
+  field: PublishField;
+  message: string;
+}
+
+export interface PublishCandidate {
+  title: string;
+  bodyText: string;
+  tags: readonly string[];
+}
+
+/**
+ * Every reason this article cannot be published, at once.
+ *
+ * All of them, not the first: SPEC-007's oracle asks for "a field-level error",
+ * and a form that reveals its next problem only after you fix the current one
+ * is a form the author submits four times. Same reasoning as
+ * `validateSignUp` in `lib/auth/validation.ts`, and deliberately the same
+ * shape, so the editor's error rendering looks like the sign-up form's.
+ */
+export function validatePublish(candidate: PublishCandidate): PublishFieldError[] {
+  const errors: PublishFieldError[] = [];
+
+  if (candidate.title.trim().length === 0) {
+    errors.push({ field: 'title', message: 'Give the article a title before publishing.' });
+  }
+
+  // Measured on `bodyText` — the canonical plaintext projection from
+  // `lib/derive/reading.ts` — and not on the raw JSON or the HTML. Counting
+  // characters of `bodyJson` would let an article of markup and no words past
+  // the guard; counting HTML would make the threshold depend on how many tags
+  // the author happened to use.
+  const length = candidate.bodyText.trim().length;
+  if (length < MIN_BODY_TEXT_CHARS) {
+    errors.push({
+      field: 'body',
+      message: `Write at least ${MIN_BODY_TEXT_CHARS} characters — this draft has ${length}.`,
+    });
+  }
+
+  const tags = normalizeTagList(candidate.tags);
+  if (tags.length < MIN_TAGS) {
+    errors.push({ field: 'tags', message: 'Add at least one tag so readers can find this.' });
+  } else if (tags.length > MAX_TAGS) {
+    errors.push({
+      field: 'tags',
+      message: `Use at most ${MAX_TAGS} tags — this draft has ${tags.length}.`,
+    });
+  }
+
+  return errors;
+}
+
+/**
+ * Drop blanks and exact duplicates, preserving order.
+ *
+ * Counting is done on this list rather than on the raw input so that a trailing
+ * empty chip left behind by the tag input does not read as a tag, and so
+ * `['a', 'a']` is one tag — which is what `setArticleTags` will store, and the
+ * guard must agree with the write or an article can pass validation and then
+ * fail to persist what was validated.
+ */
+export function normalizeTagList(tags: readonly string[] | undefined): string[] {
+  if (!tags) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of tags) {
+    const value = typeof raw === 'string' ? raw.trim() : '';
+    if (value.length === 0) continue;
+    const key = value.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(value);
+  }
+  return out;
+}
+
+/** True when nothing blocks publication. */
+export function canPublish(candidate: PublishCandidate): boolean {
+  return validatePublish(candidate).length === 0;
+}
+
+// ---------------------------------------------------------------------------
+// The save request, and what comes back
 // ---------------------------------------------------------------------------
 
 /** The payload SPEC-007 names: `saveDraft(id, { title, subtitle, bodyJson, coverPath, tags })`. */
@@ -311,177 +433,3 @@ export type SaveDraftResult = SaveDraftOk | SaveDraftConflict | SaveDraftRejecte
 
 export const CONFLICT_MESSAGE =
   'This draft was changed somewhere else. Reload to get the newer version — nothing you typed here has been saved over it.';
-
-/**
- * Apply one autosave.
- *
- * Ordering is the whole contract, and it is: read, compare, reject-or-write.
- * Nothing before the version comparison writes anything, so a stale save leaves
- * the row byte-identical — including `updatedAt` and `version`, which a
- * "write then detect" implementation would have moved.
- *
- * Authorization is NOT checked here. It is checked by the Server Action through
- * `guardArticleMutation`, which makes the write unreachable unless the caller
- * owns the article. Doing it in both places would mean two rules to keep in
- * step; doing it in the combinator means the check cannot be skipped.
- */
-export async function saveDraftContent(
-  articleId: string,
-  input: DraftInput,
-  now: Date = new Date(),
-): Promise<SaveDraftResult> {
-  const existing = await getArticleById(articleId);
-  if (!existing) {
-    return { ok: false, status: 404, message: 'That draft no longer exists.' };
-  }
-
-  if (!Number.isInteger(input.version) || input.version !== existing.version) {
-    return {
-      ok: false,
-      status: 409,
-      serverVersion: existing.version,
-      message: CONFLICT_MESSAGE,
-    };
-  }
-
-  // Validated before the write for the same reason as the version check: a
-  // draft whose title was cleared must not be half-saved. `normalizeTitle`
-  // throws on empty, and an untitled draft is a legitimate state to be IN — it
-  // is only publishing that requires a title — so an empty title keeps the
-  // stored one rather than failing the save. An author who selects-all-deletes
-  // their title mid-edit should not see "Save failed".
-  let title: string;
-  try {
-    title = normalizeTitle(input.title);
-  } catch (error) {
-    if (!(error instanceof EmptyTitleError)) throw error;
-    title = existing.title;
-  }
-
-  if (input.tags && input.tags.length > MAX_TAGS_PER_ARTICLE) {
-    return {
-      ok: false,
-      status: 400,
-      field: 'tags',
-      message: `An article can carry at most ${MAX_TAGS_PER_ARTICLE} tags.`,
-    };
-  }
-
-  // The sanitised document is what gets stored — never `input.bodyJson`. That
-  // is the line that makes the security boundary server-side: a client posting
-  // a hand-written document with a `<script>` node has it removed here, not in
-  // the component that happened to render it.
-  const derived = deriveContent(input.bodyJson);
-
-  const updated: ArticleRecord = await updateArticle(articleId, {
-    title,
-    subtitle: input.subtitle ?? null,
-    coverPath: input.coverPath ?? null,
-    bodyJson: toProseMirrorNode(derived.doc),
-    bodyHtml: derived.bodyHtml,
-    now,
-  });
-
-  if (input.tags) {
-    try {
-      await setArticleTags(articleId, input.tags);
-    } catch (error) {
-      // The ceiling is re-checked by the repository against the DEDUPLICATED
-      // set, so a list of six that collapses to five is legal and only this
-      // path knows it was not. The content is already saved; reporting the tag
-      // problem without losing the prose is the right trade.
-      if (!(error instanceof TooManyTagsError)) throw error;
-      return {
-        ok: false,
-        status: 400,
-        field: 'tags',
-        message: `An article can carry at most ${MAX_TAGS_PER_ARTICLE} tags.`,
-      };
-    }
-  }
-
-  return {
-    ok: true,
-    status: 200,
-    savedAt: updated.updatedAt.toISOString(),
-    version: updated.version,
-    slug: updated.slug,
-    readingMinutes: updated.readingMinutes,
-  };
-}
-
-/** The title a draft carries until its author gives it one. */
-export const UNTITLED_DRAFT = 'Untitled';
-
-/**
- * The first save of a document written at `/editor/new`.
- *
- * `/editor/new` deliberately does NOT create a row when it renders. A page that
- * mints an article on GET leaves a trail of empty drafts behind every visit,
- * every refresh and every back-button — and `/editor` is behind the session
- * check, so those rows all belong to a real author and all show up in their
- * profile's draft count. The row appears on the first autosave instead, which
- * is the first moment there is anything to store.
- *
- * `createArticle` refuses an empty title (SPEC-004: "title, 1-120 chars"), so
- * an untouched title field becomes `Untitled` here. That is a real,
- * publishable-looking name in the slug — but only until the author types one,
- * because `updateArticle` recomputes the slug from the title on every save
- * while `publishedAt` is null. The placeholder therefore cannot survive into a
- * published URL unless the author genuinely publishes something untitled, which
- * `validatePublish` refuses.
- */
-export async function createDraftContent(
-  authorId: string,
-  input: Omit<DraftInput, 'version'>,
-  now: Date = new Date(),
-): Promise<SaveDraftResult> {
-  if (input.tags && input.tags.length > MAX_TAGS_PER_ARTICLE) {
-    return {
-      ok: false,
-      status: 400,
-      field: 'tags',
-      message: `An article can carry at most ${MAX_TAGS_PER_ARTICLE} tags.`,
-    };
-  }
-
-  const derived = deriveContent(input.bodyJson);
-  const title = input.title.trim().length > 0 ? input.title : UNTITLED_DRAFT;
-
-  const created = await createArticle({
-    authorId,
-    title,
-    subtitle: input.subtitle ?? null,
-    bodyJson: toProseMirrorNode(derived.doc),
-    bodyHtml: derived.bodyHtml,
-    coverPath: input.coverPath ?? null,
-    now,
-  });
-
-  if (input.tags && input.tags.length > 0) {
-    try {
-      await setArticleTags(created.id, input.tags);
-    } catch (error) {
-      if (!(error instanceof TooManyTagsError)) throw error;
-      return {
-        ok: false,
-        status: 400,
-        field: 'tags',
-        message: `An article can carry at most ${MAX_TAGS_PER_ARTICLE} tags.`,
-      };
-    }
-  }
-
-  return {
-    ok: true,
-    status: 200,
-    savedAt: created.updatedAt.toISOString(),
-    version: created.version,
-    slug: created.slug,
-    readingMinutes: created.readingMinutes,
-    articleId: created.id,
-  };
-}
-
-/** Re-exported so a caller catching a repository error does not import two modules. */
-export { DerivedBodyMismatchError };
