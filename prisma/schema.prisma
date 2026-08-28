@@ -1,0 +1,174 @@
+// titan — the single source of truth for every entity (SPEC-004).
+//
+// Every module reads and writes through the typed repositories in `lib/db/`;
+// no module opens its own SQLite handle. See `lib/db/client.ts` for the one
+// connection, and `prisma/migrations/` for the append-only migration history.
+//
+// Two shapes here are deliberate and worth stating, because neither is
+// visible from the model definitions alone:
+//
+//  1. `article_fts` — the FTS5 virtual table SPEC-008 ranks search over — is
+//     NOT modelled here. Prisma has no representation for a virtual table, so
+//     it is created in the hand-written migration and reached through raw SQL.
+//     It is listed in SPEC-004's acceptance criteria alongside the eight real
+//     tables, so `schema.test.ts` asserts it from `sqlite_master` rather than
+//     from anything Prisma generates.
+//
+//  2. `PRAGMA journal_mode = WAL` is set by the migration, not by the client.
+//     WAL is a persistent property of the database FILE, so setting it once at
+//     creation makes every later connection inherit it — including connections
+//     opened by tooling that never loads `lib/db/client.ts` (which is exactly
+//     what `tests/unit/db-pragmas.test.ts` opens).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+/// A person. `email` and `handle` are both natural keys; both are stored
+/// already-normalised (lowercased) by `lib/db/users.ts` so uniqueness is
+/// decided on the normalised form rather than on whatever was typed.
+model User {
+  id           String    @id
+  email        String    @unique
+  passwordHash String
+  handle       String    @unique
+  name         String
+  bio          String?
+  avatarPath   String?
+  coverPath    String?
+  /// `{ twitter?, github?, website? }` as a JSON string. SPEC-004 names the
+  /// type `Json`; the SQLite connector has no Json type (DEC-001 states this
+  /// outright — "JSON columns are text"), so the column is TEXT and
+  /// `lib/db/users.ts` is the only thing that parses or serialises it. The
+  /// typed shape lives at `SocialLinks` there, not in the database.
+  socials      String
+  createdAt    DateTime
+
+  articles  Article[]
+  claps     Clap[]
+  bookmarks Bookmark[]
+  sessions  Session[]
+  following Follow[]   @relation("FollowerToUser")
+  followers Follow[]   @relation("FollowingToUser")
+}
+
+/// An article in either state. `bodyJson` is canonical (DEC-002); `bodyHtml`,
+/// `bodyText` and `readingMinutes` are derived caches regenerated on every
+/// save — `lib/derive/reading.ts` owns the last two derivations.
+///
+/// `status` is a checked String rather than an enum because SQLite has none;
+/// `lib/db/articles.ts` is the only writer and constrains it to DRAFT |
+/// PUBLISHED. `version` carries the optimistic-concurrency counter SPEC-007's
+/// autosave compares against.
+model Article {
+  id             String    @id
+  authorId       String
+  slug           String    @unique
+  title          String
+  subtitle       String?
+  /// The canonical ProseMirror document, as a JSON string. Same reason as
+  /// `User.socials`: SQLite has no Json type. `lib/db/articles.ts` parses and
+  /// serialises it so no caller handles the raw text.
+  bodyJson       String
+  bodyHtml       String
+  bodyText       String
+  coverPath      String?
+  readingMinutes Int
+  status         String
+  version        Int       @default(1)
+  publishedAt    DateTime?
+  createdAt      DateTime
+  updatedAt      DateTime
+
+  author    User         @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  tags      ArticleTag[]
+  claps     Clap[]
+  bookmarks Bookmark[]
+
+  @@index([status, publishedAt(sort: Desc)])
+  @@index([authorId, status])
+}
+
+model Tag {
+  id   String @id
+  slug String @unique
+  name String
+
+  articles ArticleTag[]
+}
+
+/// Join row. The 5-tags-per-article ceiling is a repository rule, not a
+/// database one — SQLite cannot express "at most five rows sharing a column",
+/// so `lib/db/tags.ts` enforces it and `repo-tag.test.ts` proves it.
+model ArticleTag {
+  articleId String
+  tagId     String
+
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+  tag     Tag     @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([articleId, tagId])
+  @@index([tagId])
+}
+
+/// Directed edge. `followerId != followingId` is enforced in the repository
+/// (see `SelfFollowError`); a CHECK constraint would express it in the schema
+/// but Prisma cannot emit one, and a rule split across two places is worse
+/// than one place that is tested.
+model Follow {
+  followerId  String
+  followingId String
+  createdAt   DateTime
+
+  follower  User @relation("FollowerToUser", fields: [followerId], references: [id], onDelete: Cascade)
+  following User @relation("FollowingToUser", fields: [followingId], references: [id], onDelete: Cascade)
+
+  @@id([followerId, followingId])
+  @@index([followerId])
+  @@index([followingId])
+}
+
+/// One row per (user, article) holding that reader's cumulative claps, 1..50.
+/// `clapTotal` is never stored — it is `SUM(count)` at read time (SPEC-004).
+model Clap {
+  userId    String
+  articleId String
+  count     Int
+  createdAt DateTime
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, articleId])
+  @@index([articleId])
+}
+
+model Bookmark {
+  userId    String
+  articleId String
+  createdAt DateTime
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  article Article @relation(fields: [articleId], references: [id], onDelete: Cascade)
+
+  @@id([userId, articleId])
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+/// Opaque database session (DEC-005). The table lives here; SPEC-005 owns the
+/// rules that write it.
+model Session {
+  id        String   @id
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
