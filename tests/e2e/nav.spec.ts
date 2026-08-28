@@ -36,7 +36,7 @@
 
 import { expect, test, type Page } from '@playwright/test';
 
-import { disconnectDb } from '../../lib/db/client';
+import { disconnectDb, getDb } from '../../lib/db/client';
 import { deleteUser, findUserByEmail } from '../../lib/db/users';
 
 // ---------------------------------------------------------------------------
@@ -399,18 +399,73 @@ test.describe('SPEC-011 — an unmatched path is a real 404', () => {
 
 test.describe('SPEC-011 — navigation never shows a blank frame', () => {
   /**
-   * The routes the criterion names. Two of them belong to slices that have not
-   * landed, so each is probed rather than assumed — the assertion is real and
-   * arms itself as `/article/[slug]` (TASK-009) and `/@[handle]` (TASK-010)
-   * appear. Nothing here needs editing when they do.
+   * The routes the criterion names. Each resolves to a REAL path from the seed
+   * corpus, and that is the whole point of the shape.
+   *
+   * ── The trap this replaces (fixed under MSG-2430) ────────────────────────
+   * This list used to hold the literals `/article/any-slug` and `/@anyone`,
+   * with the loop below skipping when the response was a 404 and reporting
+   * "does not resolve yet". While `/article/[slug]` did not exist, that read
+   * correctly. But `any-slug` is not a real slug, so the moment TASK-009
+   * shipped the route it would STILL 404 — and the guard would skip forever,
+   * announcing a missing slice that had in fact landed.
+   *
+   * Worse, it was the CORRECTNESS of the fix that disarmed it. Under the soft
+   * 404 that a root `app/loading.tsx` produced, an unknown slug answered 200
+   * and this test armed and passed against the not-found page. Shipping a real
+   * hard 404 is what turned it off. A test that goes dark precisely when the
+   * bug it sits next to is fixed is worse than no test: the skip message
+   * actively misleads the next reader.
+   *
+   * Resolving a real slug restores the intended meaning — a 404 here now means
+   * "the route is not built", never "that row does not exist" — and it makes
+   * the assertion stronger, because it renders a real article rather than the
+   * 404 page.
    */
   const CRITERION_ROUTES = [
-    { path: '/', owner: 'TASK-007 (Feed & Search)' },
-    { path: '/article/any-slug', owner: 'TASK-009 (Reading & Engagement)' },
-    { path: '/@anyone', owner: 'TASK-010 (Profiles)' },
+    {
+      name: '/',
+      owner: 'TASK-007 (Feed & Search)',
+      resolve: async () => '/',
+    },
+    {
+      name: '/article/[slug]',
+      owner: 'TASK-009 (Reading & Engagement)',
+      resolve: async () => {
+        // Ordered by id so the same row is chosen on every run — SPEC-002's
+        // determinism rule applies to what a test selects, not only to what
+        // the seed writes.
+        const article = await getDb().article.findFirst({
+          where: { status: 'PUBLISHED' },
+          select: { slug: true },
+          orderBy: { id: 'asc' },
+        });
+        return article ? `/article/${article.slug}` : null;
+      },
+    },
+    {
+      name: '/@[handle]',
+      owner: 'TASK-010 (Profiles)',
+      resolve: async () => {
+        const user = await getDb().user.findFirst({
+          select: { handle: true },
+          orderBy: { id: 'asc' },
+        });
+        return user ? `/@${user.handle}` : null;
+      },
+    },
   ];
 
-  test('app/loading.tsx renders the Skeleton primitive, not a blank frame', async ({ page }) => {
+  test('the route loading fallback renders the Skeleton primitive, not a blank frame', async ({
+    page,
+  }) => {
+    // The fallback moved from `app/loading.tsx` to `app/bookmarks/loading.tsx`
+    // in TASK-009 (operator ruling MSG-2428). A `loading.tsx` at the app ROOT
+    // wraps every page in a Suspense boundary whose fallback flushes before any
+    // page resolves, which commits HTTP 200 and makes `notFound()` structurally
+    // unable to answer 404 anywhere in the product. The markup below is
+    // unchanged; only its segment moved. SPEC-011 asks for a loading file "per
+    // route group", which is what this now is.
     // The mechanism, asserted directly rather than inferred from a race.
     // Playwright's `waitUntil: 'commit'` returns as soon as the response
     // starts, so the Suspense fallback is observable before the page settles.
@@ -432,11 +487,18 @@ test.describe('SPEC-011 — navigation never shows a blank frame', () => {
   });
 
   for (const route of CRITERION_ROUTES) {
-    test(`${route.path} is never a blank frame`, async ({ page }) => {
-      const response = await page.goto(route.path);
+    test(`${route.name} is never a blank frame`, async ({ page }) => {
+      const path = await route.resolve();
+      test.skip(
+        path === null,
+        `skipped: the seed corpus holds no row to build ${route.name} from`,
+      );
+
+      const response = await page.goto(path as string);
+      // With a real path, a 404 can only mean the route itself is not built.
       test.skip(
         response?.status() === 404,
-        `skipped: needs ${route.owner} — ${route.path} does not resolve yet`,
+        `skipped: needs ${route.owner} — ${route.name} is not built yet`,
       );
 
       // Something is painted, and it is not an empty document. `<body>` always

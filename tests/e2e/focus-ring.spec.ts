@@ -77,11 +77,39 @@ interface RingReport {
   matchesFocusVisible: boolean;
 }
 
+/**
+ * Next's dev-tools overlay.
+ *
+ * It is a focusable custom element injected by `next dev` — which is exactly
+ * what this harness boots — it carries no focus ring, and it belongs to no
+ * slice. Without excluding it the real-page sweep below cannot complete for
+ * ANY route: it fails on `nextjs-portal`, reporting `Expected >= 2, Received
+ * 0` against the browser's own debug UI. The `/` half passed only by luck of
+ * where the portal happened to sit in the tab order.
+ *
+ * Excluding it widens what this test proves rather than narrowing it — an
+ * assertion that cannot finish proves nothing about the elements after the
+ * one it died on.
+ */
+const DEV_OVERLAY = 'nextjs-portal';
+
 /** Tab to the next element and describe the ring it is wearing. */
-async function tabAndInspect(page: Page): Promise<RingReport> {
+async function tabAndInspect(page: Page): Promise<RingReport | null> {
   await page.keyboard.press('Tab');
-  return page.evaluate(() => {
-    const el = document.activeElement as HTMLElement;
+  return page.evaluate((overlay) => {
+    const el = document.activeElement as HTMLElement | null;
+    // `null` means "not a product element" — the caller skips it rather than
+    // asserting a ring on something that was never interactive.
+    //
+    // Two cases. The dev-tools overlay, per DEV_OVERLAY above. And `<body>` /
+    // `<html>`, which is what `document.activeElement` falls back to once the
+    // tab order wraps out of the document into the browser's own chrome — that
+    // is "nothing is focused", not "a focusable element with no ring", and
+    // asserting a 2px outline on it is asserting against the wrong thing.
+    if (!el) return null;
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'body' || tag === 'html') return null;
+    if (tag === overlay || el.closest(overlay)) return null;
     const style = getComputedStyle(el);
     return {
       tag: el.tagName.toLowerCase() + (el.getAttribute('role') ? `[role=${el.getAttribute('role')}]` : ''),
@@ -91,16 +119,19 @@ async function tabAndInspect(page: Page): Promise<RingReport> {
       outlineOffset: Number.parseFloat(style.outlineOffset),
       matchesFocusVisible: el.matches(':focus-visible'),
     };
-  });
+  }, DEV_OVERLAY);
 }
 
 /** How many things the keyboard can reach on the mounted page. */
 async function tabbableCount(page: Page): Promise<number> {
   return page.evaluate(
-    () =>
-      document.querySelectorAll(
-        'a[href], button:not([disabled]), input:not([disabled]), [role="button"][tabindex], [tabindex]:not([tabindex="-1"])',
-      ).length,
+    (overlay) =>
+      Array.from(
+        document.querySelectorAll(
+          'a[href], button:not([disabled]), input:not([disabled]), [role="button"][tabindex], [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((node) => !node.closest(overlay)).length,
+    DEV_OVERLAY,
   );
 }
 
@@ -123,8 +154,9 @@ for (const theme of THEMES) {
       expect(total, 'nothing was tabbable — the fixture did not mount').toBeGreaterThan(5);
 
       const seen: RingReport[] = [];
-      for (let i = 0; i < total; i += 1) {
+      for (let i = 0; i < total + 4 && seen.length < total; i += 1) {
         const report = await tabAndInspect(page);
+        if (report === null) continue;
         seen.push(report);
 
         expect(report.matchesFocusVisible, `${report.tag} did not match :focus-visible`).toBe(true);
@@ -219,12 +251,19 @@ test.describe('the ring survives a real page, not just a fixture', () => {
       const total = await tabbableCount(page);
       expect(total).toBeGreaterThan(0);
 
-      for (let i = 0; i < total; i += 1) {
+      // A few extra presses so the sweep still covers `total` PRODUCT elements
+      // after skipping any the dev overlay interleaves into the tab order.
+      let checked = 0;
+      for (let i = 0; i < total + 4 && checked < total; i += 1) {
         const report = await tabAndInspect(page);
+        if (report === null) continue;
+        checked += 1;
         expect(report.outlineWidth, `${route} ${report.tag}`).toBeGreaterThanOrEqual(2);
-        expect(report.outlineStyle).not.toBe('none');
-        expect(report.outlineOffset).toBeGreaterThanOrEqual(2);
+        expect(report.outlineStyle, `${route} ${report.tag}`).not.toBe('none');
+        expect(report.outlineOffset, `${route} ${report.tag}`).toBeGreaterThanOrEqual(2);
       }
+      // A sweep that skipped everything would pass vacuously.
+      expect(checked, `${route} exposed no product element to the keyboard`).toBeGreaterThan(0);
     });
   }
 });
