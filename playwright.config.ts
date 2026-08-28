@@ -49,7 +49,38 @@ export function appIsBootable(): boolean {
 export const WEB_SERVER = {
   command: process.env.PW_WEBSERVER ?? 'npm run dev',
   url: BASE_URL,
-  reuseExistingServer: !process.env.CI,
+
+  // Always boot a server this run owns, and never adopt one that was already
+  // listening. Two reasons, both learned from a gate run that hung:
+  //
+  //  1. Correctness. The criterion is that a *clean boot* answers on 3000.
+  //     Adopting a server someone else started proves nothing about this
+  //     tree's boot, and would happily go green against a stale build of a
+  //     different commit.
+  //  2. Teardown. Playwright only kills a web server it started itself. Under
+  //     `reuseExistingServer` an adopted `next dev` outlives the run still
+  //     holding the stdio pipes it inherited, and the parent `npm test` blocks
+  //     forever waiting on a pipe that never closes — the suite reports every
+  //     test passed and then simply never exits.
+  //
+  // The failure mode this replaces is a silent multi-minute hang. The failure
+  // mode it introduces is Playwright refusing to start with "port 3000 is
+  // already used", which names the problem in one line.
+  reuseExistingServer: false,
+
+  // Ask the server tree to stop before killing it. `npm run dev` is three
+  // processes deep (npm -> next -> next-server); a bare SIGKILL to the group
+  // can leave the grandchild orphaned on port 3000, which is precisely what
+  // makes the *next* run fail to bind.
+  gracefulShutdown: { signal: 'SIGTERM', timeout: 5_000 },
+
+  // Own the server's output explicitly rather than letting it inherit this
+  // process's stdio. An inherited pipe held open by a surviving child is the
+  // other half of the hang described above; piping also keeps the dev server's
+  // log attributable when a boot failure needs reading.
+  stdout: 'pipe',
+  stderr: 'pipe',
+
   timeout: 60_000, // SPEC-001: HTTP 200 within 60s of a clean boot
 } as const;
 
@@ -74,6 +105,18 @@ export default defineConfig({
 
   timeout: 60_000,
   expect: { timeout: 10_000 },
+
+  // A ceiling on the entire run, teardown included.
+  //
+  // Per-test timeouts do not bound the run: a suite can pass every test and
+  // then hang in teardown, which is exactly how this harness once burned nine
+  // minutes of a gate and reported nothing at all. Whatever kills the run
+  // should be Playwright, because Playwright says why; an outer harness
+  // timeout just truncates the log mid-sentence.
+  //
+  // The whole suite is seconds today and is bounded by 60s x test count even
+  // once every slice has landed, so this is slack, not a budget.
+  globalTimeout: Number(process.env.PW_GLOBAL_TIMEOUT ?? 8 * 60_000),
 
   use: {
     baseURL: BASE_URL,
