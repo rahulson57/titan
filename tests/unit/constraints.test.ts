@@ -22,6 +22,18 @@ import { fileURLToPath } from 'node:url';
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 const read = (p: string) => readFileSync(join(REPO_ROOT, p), 'utf8');
+
+/**
+ * The absolute path Prisma will actually open for a sqlite `file:` URL.
+ *
+ * A relative path is resolved against the SCHEMA directory — `prisma/` — not
+ * against the repository root and not against the process cwd. An absolute one
+ * is used as given, which is how `tests/helpers/db.ts` hands each suite its own
+ * throwaway database.
+ */
+const resolveDatabaseUrl = (url: string) =>
+  resolve(join(REPO_ROOT, 'prisma'), url.replace(/^file:/, ''));
+
 const pkg = JSON.parse(read('package.json')) as {
   scripts: Record<string, string>;
   engines?: { node?: string };
@@ -194,7 +206,32 @@ describe('SPEC-001 — no external services', () => {
   });
 
   it('keeps the database as a local file under ./data/', () => {
-    expect(read('.env.example')).toMatch(/DATABASE_URL="file:\.\/data\/titan\.db"/);
+    // Asserts the RESOLVED location, not the configured string. The string is
+    // exactly what let this test stay green for four slices while the database
+    // sat in `prisma/data/` (TASK-016): Prisma resolves a relative sqlite
+    // `file:` URL against the directory holding `schema.prisma`, so
+    // `file:./data/titan.db` reads as the repo root and means `prisma/data/`.
+    // Pinning a corrected literal here would repeat the defect, so this does
+    // the resolution instead. `tests/unit/db-pragmas.test.ts` proves the same
+    // claim from the other end, by migrating and looking at where the file lands.
+    //
+    // Both files are checked because they are read by different consumers and
+    // have drifted apart before: the Prisma CLI reads `.env`, and `.env.example`
+    // is the template `npm run setup` turns into the app's `.env.local`.
+    for (const file of ['.env', '.env.example']) {
+      const url = /^DATABASE_URL="(.+)"$/m.exec(read(file))?.[1];
+
+      expect(
+        url,
+        `${file} must declare DATABASE_URL — the Prisma CLI cannot read .env.local (DEC-013)`,
+      ).toBeTruthy();
+      expect(url, `${file}: DATABASE_URL must be a local file: URL`).toMatch(/^file:/);
+      expect(
+        resolveDatabaseUrl(url as string),
+        `${file}: DATABASE_URL="${url}" does not resolve to ./data/titan.db. ` +
+          'A relative path here is resolved against prisma/, not the repository root.',
+      ).toBe(join(REPO_ROOT, 'data', 'titan.db'));
+    }
   });
 
   it('commits .env.example and git-ignores .env.local', () => {
