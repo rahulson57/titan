@@ -8,7 +8,10 @@ desktop.ini
 
 # Dependencies & build output (committing these breaks Nexus landings)
 node_modules/
-.env
+# `.env` is COMMITTED — it holds non-secret defaults (DATABASE_URL) that the
+# Prisma CLI must be able to read on a clean clone; the CLI cannot see
+# `.env.local`. See the header in `.env` and DEC-013. `.env.local` holds the
+# generated AUTH_SECRET and must never be committed.
 .env.local
 *.log
 
