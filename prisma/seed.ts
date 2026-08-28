@@ -276,22 +276,72 @@ async function resolvePasswordHash(): Promise<string> {
 }
 
 // ---------------------------------------------------------------------------
-// The corpus
+// The corpus, built one table at a time
 // ---------------------------------------------------------------------------
+//
+// Each builder below draws from the one PRNG stream and returns plain rows;
+// `main` calls them in a fixed order and only then writes. Splitting the work
+// this way does not perturb determinism — the draw *sequence* is what the
+// corpus hashes depend on, and it is unchanged: users, then tags, then
+// articles, then claps, follows, bookmarks. Reordering these calls, or drawing
+// inside the write step, would change the corpus even though every count
+// stayed the same.
 
-async function main(): Promise<void> {
-  const random = createSeededRandom(PRNG_SEED);
-  const nextId = () => createIdFrom(random);
-  const db = getDb();
-  const passwordHash = await resolvePasswordHash();
+type SeedUser = {
+  id: string;
+  email: string;
+  passwordHash: string;
+  handle: string;
+  name: string;
+  bio: string;
+  avatarPath: null;
+  coverPath: null;
+  socials: string;
+  createdAt: Date;
+};
 
-  // -- Users ---------------------------------------------------------------
-  const users = Array.from({ length: COUNTS.users }, (_, index) => {
+type SeedTag = { id: string; slug: string; name: string };
+
+type SeedArticle = {
+  id: string;
+  authorId: string;
+  slug: string;
+  title: string;
+  subtitle: string | null;
+  bodyJson: string;
+  bodyHtml: string;
+  bodyText: string;
+  coverPath: null;
+  readingMinutes: number;
+  status: string;
+  version: number;
+  publishedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+type SeedArticleTag = { articleId: string; tagId: string };
+type SeedClap = { userId: string; articleId: string; count: number; createdAt: Date };
+type SeedFollow = { followerId: string; followingId: string; createdAt: Date };
+type SeedBookmark = { userId: string; articleId: string; createdAt: Date };
+
+type Corpus = {
+  users: SeedUser[];
+  tags: SeedTag[];
+  articles: SeedArticle[];
+  articleTags: SeedArticleTag[];
+  claps: SeedClap[];
+  follows: SeedFollow[];
+  bookmarks: SeedBookmark[];
+};
+
+function buildUsers(random: Random, passwordHash: string): SeedUser[] {
+  return Array.from({ length: COUNTS.users }, (_, index) => {
     const first = pick(random, FIRST_NAMES);
     const last = pick(random, LAST_NAMES);
     const handle = index === 0 ? DEMO_HANDLE : `${first.toLowerCase()}_${index}`;
     return {
-      id: nextId(),
+      id: createIdFrom(random),
       email: index === 0 ? DEMO_EMAIL : `${handle}@titan.local`,
       passwordHash,
       handle,
@@ -309,92 +359,102 @@ async function main(): Promise<void> {
       createdAt: new Date(BASE_MS + index * DAY),
     };
   });
+}
 
-  // -- Tags ----------------------------------------------------------------
-  const tags = TAG_NAMES.slice(0, COUNTS.tags).map((name) => ({
-    id: nextId(),
+function buildTags(random: Random): SeedTag[] {
+  return TAG_NAMES.slice(0, COUNTS.tags).map((name) => ({
+    id: createIdFrom(random),
     slug: name,
     name: name.charAt(0).toUpperCase() + name.slice(1),
   }));
+}
 
-  // -- Articles ------------------------------------------------------------
-  const totalArticles = COUNTS.publishedArticles + COUNTS.draftArticles;
-  const articles: Array<{
-    id: string;
-    authorId: string;
-    slug: string;
-    title: string;
-    subtitle: string | null;
-    bodyJson: string;
-    bodyHtml: string;
-    bodyText: string;
-    coverPath: null;
-    readingMinutes: number;
-    status: string;
-    version: number;
-    publishedAt: Date | null;
-    createdAt: Date;
-    updatedAt: Date;
-  }> = [];
-  const articleTagRows: Array<{ articleId: string; tagId: string }> = [];
+/**
+ * One article plus the tag edges it owns.
+ *
+ * `index` decides publication rather than a coin flip: the first
+ * `COUNTS.publishedArticles` are PUBLISHED and the rest are DRAFT, so the
+ * split seed-counts.test.ts asserts is a property of the loop, not of luck.
+ */
+function buildArticle(
+  random: Random,
+  index: number,
+  users: SeedUser[],
+  tags: SeedTag[],
+): { article: SeedArticle; articleTags: SeedArticleTag[] } {
+  const published = index < COUNTS.publishedArticles;
+  const id = createIdFrom(random);
+  const author = users[index % users.length]!;
+  const title = `${pick(random, TITLE_OPENERS)} ${pick(random, TITLE_SUBJECTS)}`;
 
-  for (let index = 0; index < totalArticles; index++) {
-    const published = index < COUNTS.publishedArticles;
-    const id = nextId();
-    const author = users[index % users.length]!;
-    const title = `${pick(random, TITLE_OPENERS)} ${pick(random, TITLE_SUBJECTS)}`;
+  // SPEC-004: bodies are 400-1800 words.
+  const doc = buildDoc(random, pickInt(random, 400, 1_800));
+  const derived = deriveReading(doc);
 
-    // SPEC-004: bodies are 400-1800 words.
-    const doc = buildDoc(random, pickInt(random, 400, 1_800));
-    const derived = deriveReading(doc);
+  // Strictly increasing from the base timestamp, so every createdAt is
+  // >= BASE_TIMESTAMP and the corpus has a stable chronological order for
+  // the recency half of SPEC-008's ranking formula.
+  const createdAt = new Date(BASE_MS + index * 6 * HOUR);
+  const publishedAt = published
+    ? new Date(createdAt.getTime() + pickInt(random, 1, 48) * HOUR)
+    : null;
 
-    // Strictly increasing from the base timestamp, so every createdAt is
-    // >= BASE_TIMESTAMP and the corpus has a stable chronological order for
-    // the recency half of SPEC-008's ranking formula.
-    const createdAt = new Date(BASE_MS + index * 6 * HOUR);
-    const publishedAt = published
-      ? new Date(createdAt.getTime() + pickInt(random, 1, 48) * HOUR)
-      : null;
+  const article: SeedArticle = {
+    id,
+    authorId: author.id,
+    slug: buildSlug(title, id),
+    title,
+    subtitle: sentence(random, pickInt(random, 6, 14)).slice(0, 160),
+    bodyJson: JSON.stringify(doc),
+    bodyHtml: toHtml(doc),
+    bodyText: derived.bodyText,
+    coverPath: null,
+    readingMinutes: derived.readingMinutes,
+    status: published ? ARTICLE_STATUS.PUBLISHED : ARTICLE_STATUS.DRAFT,
+    version: 1,
+    publishedAt,
+    createdAt,
+    updatedAt: publishedAt ?? createdAt,
+  };
 
-    articles.push({
-      id,
-      authorId: author.id,
-      slug: buildSlug(title, id),
-      title,
-      subtitle: sentence(random, pickInt(random, 6, 14)).slice(0, 160),
-      bodyJson: JSON.stringify(doc),
-      bodyHtml: toHtml(doc),
-      bodyText: derived.bodyText,
-      coverPath: null,
-      readingMinutes: derived.readingMinutes,
-      status: published ? ARTICLE_STATUS.PUBLISHED : ARTICLE_STATUS.DRAFT,
-      version: 1,
-      publishedAt,
-      createdAt,
-      updatedAt: publishedAt ?? createdAt,
-    });
+  // 1-5 tags per article, deduplicated — the ceiling `lib/db/tags.ts`
+  // enforces is respected by the fixture that feeds every tag page.
+  const wanted = pickInt(random, 1, 5);
+  const chosen = new Set<string>();
+  while (chosen.size < wanted) chosen.add(pick(random, tags).id);
 
-    // 1-5 tags per article, deduplicated — the ceiling `lib/db/tags.ts`
-    // enforces is respected by the fixture that feeds every tag page.
-    const wanted = pickInt(random, 1, 5);
-    const chosen = new Set<string>();
-    while (chosen.size < wanted) chosen.add(pick(random, tags).id);
-    for (const tagId of chosen) articleTagRows.push({ articleId: id, tagId });
+  return { article, articleTags: [...chosen].map((tagId) => ({ articleId: id, tagId })) };
+}
+
+function buildArticles(
+  random: Random,
+  users: SeedUser[],
+  tags: SeedTag[],
+): { articles: SeedArticle[]; articleTags: SeedArticleTag[] } {
+  const total = COUNTS.publishedArticles + COUNTS.draftArticles;
+  const articles: SeedArticle[] = [];
+  const articleTags: SeedArticleTag[] = [];
+  for (let index = 0; index < total; index++) {
+    const built = buildArticle(random, index, users, tags);
+    articles.push(built.article);
+    articleTags.push(...built.articleTags);
   }
+  return { articles, articleTags };
+}
 
-  const publishedArticles = articles.filter((a) => a.status === ARTICLE_STATUS.PUBLISHED);
-
-  // -- Claps ---------------------------------------------------------------
-  // Claps land on published articles only: a clap on a draft nobody can read
-  // would make `clapTotal` disagree with what the feed can possibly show.
-  const claps: Array<{ userId: string; articleId: string; count: number; createdAt: Date }> = [];
-  const clapKeys = new Set<string>();
+/**
+ * Claps land on published articles only: a clap on a draft nobody can read
+ * would make `clapTotal` disagree with what the feed can possibly show.
+ */
+function buildClaps(random: Random, users: SeedUser[], published: SeedArticle[]): SeedClap[] {
+  const claps: SeedClap[] = [];
+  const seen = new Set<string>();
   while (claps.length < COUNTS.claps) {
     const user = pick(random, users);
-    const article = pick(random, publishedArticles);
+    const article = pick(random, published);
     const key = `${user.id}:${article.id}`;
-    if (clapKeys.has(key)) continue;
-    clapKeys.add(key);
+    if (seen.has(key)) continue;
+    seen.add(key);
     claps.push({
       userId: user.id,
       articleId: article.id,
@@ -402,50 +462,84 @@ async function main(): Promise<void> {
       createdAt: new Date((article.publishedAt ?? article.createdAt).getTime() + HOUR),
     });
   }
+  return claps;
+}
 
-  // -- Follows -------------------------------------------------------------
-  const follows: Array<{ followerId: string; followingId: string; createdAt: Date }> = [];
-  const followKeys = new Set<string>();
+function buildFollows(random: Random, users: SeedUser[]): SeedFollow[] {
+  const follows: SeedFollow[] = [];
+  const seen = new Set<string>();
   while (follows.length < COUNTS.follows) {
     const follower = pick(random, users);
     const following = pick(random, users);
     if (follower.id === following.id) continue; // the SelfFollowError case
     const key = `${follower.id}:${following.id}`;
-    if (followKeys.has(key)) continue;
-    followKeys.add(key);
+    if (seen.has(key)) continue;
+    seen.add(key);
     follows.push({
       followerId: follower.id,
       followingId: following.id,
       createdAt: new Date(BASE_MS + follows.length * HOUR),
     });
   }
+  return follows;
+}
 
-  // -- Bookmarks -----------------------------------------------------------
-  const bookmarks: Array<{ userId: string; articleId: string; createdAt: Date }> = [];
-  const bookmarkKeys = new Set<string>();
+function buildBookmarks(
+  random: Random,
+  users: SeedUser[],
+  published: SeedArticle[],
+): SeedBookmark[] {
+  const bookmarks: SeedBookmark[] = [];
+  const seen = new Set<string>();
   while (bookmarks.length < COUNTS.bookmarks) {
     const user = pick(random, users);
-    const article = pick(random, publishedArticles);
+    const article = pick(random, published);
     const key = `${user.id}:${article.id}`;
-    if (bookmarkKeys.has(key)) continue;
-    bookmarkKeys.add(key);
+    if (seen.has(key)) continue;
+    seen.add(key);
     bookmarks.push({
       userId: user.id,
       articleId: article.id,
       createdAt: new Date(BASE_MS + bookmarks.length * HOUR),
     });
   }
+  return bookmarks;
+}
 
-  // -- Write ---------------------------------------------------------------
-  // One transaction. Not for atomicity theatre: SQLite commits (and fsyncs)
-  // per statement otherwise, which turns ~3 300 inserts into minutes rather
-  // than seconds — and this script runs several times inside `npm test`.
-  const chunk = <T>(rows: T[], size = 400): T[][] => {
-    const out: T[][] = [];
-    for (let i = 0; i < rows.length; i += size) out.push(rows.slice(i, i + size));
-    return out;
+function buildCorpus(random: Random, passwordHash: string): Corpus {
+  const users = buildUsers(random, passwordHash);
+  const tags = buildTags(random);
+  const { articles, articleTags } = buildArticles(random, users, tags);
+  const published = articles.filter((a) => a.status === ARTICLE_STATUS.PUBLISHED);
+  return {
+    users,
+    tags,
+    articles,
+    articleTags,
+    claps: buildClaps(random, users, published),
+    follows: buildFollows(random, users),
+    bookmarks: buildBookmarks(random, users, published),
   };
+}
 
+// ---------------------------------------------------------------------------
+// The write
+// ---------------------------------------------------------------------------
+
+function chunk<T>(rows: T[], size = 400): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < rows.length; i += size) out.push(rows.slice(i, i + size));
+  return out;
+}
+
+/**
+ * Write the whole corpus in one transaction.
+ *
+ * Not atomicity theatre: SQLite commits (and fsyncs) per statement otherwise,
+ * which turns ~3 300 inserts into minutes rather than seconds — and this
+ * script runs several times inside `npm test`.
+ */
+async function writeCorpus(db: ReturnType<typeof getDb>, corpus: Corpus): Promise<void> {
   await db.$transaction([
     // Delete in dependency order so re-running is a rebuild, not a pile-up.
     // (The cascades would do it from User alone; being explicit means a
@@ -459,13 +553,13 @@ async function main(): Promise<void> {
     db.session.deleteMany(),
     db.user.deleteMany(),
 
-    db.user.createMany({ data: users }),
-    db.tag.createMany({ data: tags }),
-    ...chunk(articles).map((rows) => db.article.createMany({ data: rows })),
-    ...chunk(articleTagRows).map((rows) => db.articleTag.createMany({ data: rows })),
-    ...chunk(claps).map((rows) => db.clap.createMany({ data: rows })),
-    ...chunk(follows).map((rows) => db.follow.createMany({ data: rows })),
-    ...chunk(bookmarks).map((rows) => db.bookmark.createMany({ data: rows })),
+    db.user.createMany({ data: corpus.users }),
+    db.tag.createMany({ data: corpus.tags }),
+    ...chunk(corpus.articles).map((rows) => db.article.createMany({ data: rows })),
+    ...chunk(corpus.articleTags).map((rows) => db.articleTag.createMany({ data: rows })),
+    ...chunk(corpus.claps).map((rows) => db.clap.createMany({ data: rows })),
+    ...chunk(corpus.follows).map((rows) => db.follow.createMany({ data: rows })),
+    ...chunk(corpus.bookmarks).map((rows) => db.bookmark.createMany({ data: rows })),
 
     // Rebuild the FTS5 index from the rows just written.
     //
@@ -480,19 +574,29 @@ async function main(): Promise<void> {
     // canonical projection, so the corpus cannot end up double-indexed.
     db.$executeRawUnsafe(`INSERT INTO "article_fts"("article_fts") VALUES('rebuild')`),
   ]);
+}
 
-  const usedPlaceholder = passwordHash === PLACEHOLDER_PASSWORD_HASH;
+function reportCorpus(corpus: Corpus, usedPlaceholder: boolean): void {
+  const published = corpus.articles.filter((a) => a.status === ARTICLE_STATUS.PUBLISHED).length;
   console.log(
-    `seeded ${users.length} users, ${articles.length} articles ` +
-      `(${publishedArticles.length} published + ${articles.length - publishedArticles.length} drafts), ` +
-      `${tags.length} tags, ${claps.length} claps, ${follows.length} follows, ` +
-      `${bookmarks.length} bookmarks`,
+    `seeded ${corpus.users.length} users, ${corpus.articles.length} articles ` +
+      `(${published} published + ${corpus.articles.length - published} drafts), ` +
+      `${corpus.tags.length} tags, ${corpus.claps.length} claps, ` +
+      `${corpus.follows.length} follows, ${corpus.bookmarks.length} bookmarks`,
   );
   console.log(
     usedPlaceholder
       ? `  password hashes are placeholders — lib/auth/password.ts (TASK-004) does not exist yet`
       : `  demo account: ${DEMO_EMAIL} / ${DEMO_PASSWORD}`,
   );
+}
+
+async function main(): Promise<void> {
+  const random = createSeededRandom(PRNG_SEED);
+  const passwordHash = await resolvePasswordHash();
+  const corpus = buildCorpus(random, passwordHash);
+  await writeCorpus(getDb(), corpus);
+  reportCorpus(corpus, passwordHash === PLACEHOLDER_PASSWORD_HASH);
 }
 
 main()
