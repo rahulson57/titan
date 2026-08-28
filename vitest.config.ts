@@ -58,8 +58,10 @@ export default defineConfig({
       // Note: an unimported `lib/**` file still counts as 0% rather than
       // dropping out of the denominator — otherwise a module nobody tested
       // would vanish from the measurement and the budget would quietly apply
-      // to a smaller population than it claims. Vitest 4 does this by default
-      // for everything matched by `include`; it was the `all: true` flag in v2.
+      // to a smaller population than it claims. That is `coverage.all`, which
+      // defaults to true and so is left unset: naming it here would pin this
+      // config to the versions that still accept the flag, and the acceptance
+      // gate invokes a bare `vitest` whose version this repo does not choose.
 
       thresholds: {
         statements: 80,

@@ -24,6 +24,7 @@ import { hasDbClient, hasMigratableSchema, hasSeedScript } from '../helpers/db';
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const pkg = JSON.parse(readFileSync(join(REPO_ROOT, 'package.json'), 'utf8')) as {
   scripts: Record<string, string>;
+  devDependencies: Record<string, string>;
 };
 
 describe('SPEC-002 — the single gate', () => {
@@ -233,12 +234,67 @@ describe('SPEC-002 — no guard can hide once its dependency lands', () => {
   });
 });
 
+/**
+ * The runner-version guard.
+ *
+ * `vitest` is a core package plus a separately-published coverage provider,
+ * and the two are only compatible at matching versions — mix them and the run
+ * dies during startup with `Cannot read properties of undefined (reading
+ * 'reportsDirectory')`, before a single test is collected. That is not a test
+ * failure; it is the gate failing to exist.
+ *
+ * This is not hypothetical here. The acceptance oracle runs a bare
+ * `vitest run --coverage`, not `npm run test:coverage`, so which core actually
+ * executes depends on how the runner's PATH resolves `vitest` — and a hoisted
+ * `node_modules/.bin` above this repo won this project's checkout once already.
+ * The core is therefore not fully under this package.json's control; the
+ * provider is. Pinning both to the same exact version is what keeps the two
+ * halves in step regardless of which copy of the core gets invoked.
+ *
+ * Exact versions, not ranges: `^3.2.4` on both sides still permits an install
+ * that resolves the two packages to different minors.
+ */
+describe('SPEC-002 — the runner cannot be assembled from mismatched halves', () => {
+  const core = pkg.devDependencies.vitest;
+  const provider = pkg.devDependencies['@vitest/coverage-v8'];
+
+  it('declares both halves of the coverage runner', () => {
+    expect(core, 'vitest is not a devDependency').toBeTruthy();
+    expect(provider, '@vitest/coverage-v8 is not a devDependency').toBeTruthy();
+  });
+
+  it('pins them to the same exact version', () => {
+    expect(
+      provider,
+      `@vitest/coverage-v8 (${provider}) must match vitest (${core}) exactly — a ` +
+        'mismatched provider crashes `vitest run --coverage` during startup, which ' +
+        'reads as a broken gate rather than as a failing test.',
+    ).toBe(core);
+  });
+
+  it('uses exact versions, so an install cannot drift them apart', () => {
+    for (const [name, version] of [
+      ['vitest', core],
+      ['@vitest/coverage-v8', provider],
+    ] as const) {
+      expect(
+        /^\d+\.\d+\.\d+$/.test(version ?? ''),
+        `${name} is declared as "${version}"; a range lets npm resolve the two ` +
+          'halves to different versions. Pin it exactly.',
+      ).toBe(true);
+    }
+  });
+});
+
 describe('SPEC-002 — coverage budget', () => {
   it('enforces >= 80% statements', () => {
-    const thresholds = vitestConfig.test?.coverage?.thresholds as
-      | { statements?: number }
+    // Read through a narrowed shape: `coverage` is a union over providers and
+    // the custom-provider member carries no `thresholds`, so reaching for the
+    // property on the union does not type-check.
+    const coverage = vitestConfig.test?.coverage as
+      | { thresholds?: { statements?: number } }
       | undefined;
-    expect(thresholds?.statements).toBe(80);
+    expect(coverage?.thresholds?.statements).toBe(80);
   });
 
   it('measures lib/** — the product logic — and nothing else', () => {
