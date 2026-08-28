@@ -8,46 +8,47 @@
  * > | Snippet | `snippet(article_fts, 2, '<mark>', '</mark>', '…', 24)` |
  *
  * The virtual table and its content view are SPEC-004's, created by the init
- * migration. Everything that WRITES to it is here.
+ * migration; the write triggers are created by the migration named below.
+ * Everything that QUERIES the index, and the repair path that reinstalls those
+ * triggers if a database loses them, is here.
  *
- * ── Why the triggers are created from application code ────────────────────
- * They should be in a migration, and they are not, and this is the one thing
- * in this file that is a compromise rather than a design.
+ * ── The triggers are a property of the SCHEMA, not of this module ─────────
+ * `prisma/migrations/20260828190000_fts_write_triggers/migration.sql` creates
+ * them, so they exist in every database the moment `prisma migrate deploy`
+ * returns — for every connection, including processes that never import this
+ * module (`npm run db:seed`, a `sqlite3` shell, an isolated Playwright run).
  *
- * The init migration says outright: "The write TRIGGERS that keep this in step
- * with `Article` are owned by SPEC-008 (Feed & Search) and are deliberately
- * NOT created here: this migration creates the shape those triggers will
- * maintain, nothing more." But SPEC-008's "Files owned" list contains no
- * migration, and `prisma/migrations/**` is outside this slice's file scope —
- * so the triggers were assigned to this slice without a file to put them in.
- * Writing a migration anyway would be a scope violation against a completed
- * slice's directory; skipping them would ship a search index that silently
- * stops matching reality the moment anyone publishes.
+ * They used to be installed from HERE, lazily, on the first call into the
+ * search module. That was a documented compromise rather than a design:
+ * SPEC-008 owned the triggers but its "Files owned" list contained no
+ * migration, so they were assigned to this slice with no file to put them in.
+ * The header this replaces said that moving `SEARCH_TRIGGER_SQL` into a
+ * migration verbatim would be the whole change. TASK-023 is that change, and
+ * this is what it bought:
  *
- * So they are installed here, idempotently, and the install path is followed
- * by ONE rebuild. That rebuild is what makes the arrangement correct rather
- * than merely convenient, and it is worth being precise about why:
+ *   - Index maintenance stopped being a property of EXECUTION ORDER. `npm test`
+ *     runs `vitest run && playwright test` against the same database file, the
+ *     unit search suites installed the triggers as a side effect, and so the
+ *     e2e half only ever saw a triggered database because the unit half had
+ *     gone first. `playwright test tests/e2e/publish-flow.spec.ts` on its own
+ *     skipped the FTS withdrawal test — 1 skipped before the gate, 0 after, on
+ *     the same commit — and blamed a slice that had landed hours earlier.
+ *   - The capability guard that skip lived behind is GONE rather than repaired
+ *     (see that file). A guard that can never be false is not a guard.
  *
- *   - Triggers only maintain what happens AFTER they exist. Between
- *     `prisma migrate deploy` and the first call into this module there is a
- *     window in which an article can be published, and a trigger created
- *     afterwards would never learn about it.
- *   - `INSERT INTO article_fts(article_fts) VALUES('rebuild')` re-reads the
- *     whole index from `article_fts_source`, the view that already filters to
- *     `status = 'PUBLISHED'`. So after the install the index is exactly the
- *     published set, whatever happened in that window.
- *   - After that the triggers are part of the DATABASE FILE's schema. They
- *     keep firing for every later connection, including processes that never
- *     import this module — `npm run db:seed`, a `sqlite3` shell, a future
- *     server action. This is a bootstrap, not a runtime dependency.
+ * `SEARCH_TRIGGER_SQL` and `ensureSearchIndex()` stay, and are now exactly one
+ * thing: the REPAIR path. `npm run search:reindex` is the tool someone reaches
+ * for on a database whose triggers were dropped, and it reinstalls before it
+ * rebuilds so that a rebuild is never the last correct thing to happen to the
+ * index. On a migrated database `CREATE TRIGGER IF NOT EXISTS` finds all three
+ * present and does nothing, and `ensureSearchIndex()` returns false.
  *
- * That is the difference between this and the "application-level reindex to
- * forget" SPEC-008 rejects: there is nothing for a human to remember. The
- * index self-heals on first use and is trigger-maintained forever after.
- *
- * If a later slice gains ownership of `prisma/migrations/`, moving
- * `SEARCH_TRIGGER_SQL` into a migration verbatim is the whole change; the
- * `CREATE TRIGGER IF NOT EXISTS` here would then simply never fire.
+ * The install path is still followed by ONE rebuild, for the same reason the
+ * migration ends with one: triggers only maintain what happens AFTER they
+ * exist, and `INSERT INTO article_fts(article_fts) VALUES('rebuild')` re-reads
+ * the whole index from `article_fts_source` — the view that already filters to
+ * `status = 'PUBLISHED'` — so the index is exactly the published set whatever
+ * happened before them.
  *
  * ── Why `content_rowid` work is not visible here ──────────────────────────
  * `article_fts` is an EXTERNAL CONTENT table: it stores the inverted index but
@@ -95,7 +96,15 @@ export const SEARCH_TRIGGER_NAMES = [
 ] as const;
 
 /**
- * The write triggers.
+ * The write triggers — the repair path's copy of the DDL.
+ *
+ * The canonical copy is
+ * `prisma/migrations/20260828190000_fts_write_triggers/migration.sql`, and
+ * these two must stay byte-equivalent: the migration is what every database
+ * gets, this is what `npm run search:reindex` restores when a database has
+ * lost them. A divergence would be invisible until someone repaired a database
+ * into a schema no migrated database has. The migration carries the same
+ * reasoning in its own comments so neither copy can be read without it.
  *
  * ── Why UPDATE is ONE trigger with two conditional statements ─────────────
  * The obvious shape is two triggers — `WHEN old.status='PUBLISHED'` to remove
