@@ -34,8 +34,25 @@ import { PrismaClient } from '@prisma/client';
 /** Per-connection pragmas, in the order they are applied. */
 export const CONNECTION_PRAGMAS = ['foreign_keys = ON', 'busy_timeout = 5000'] as const;
 
-/** The default when nothing sets `DATABASE_URL` (SPEC-001's boot contract). */
-export const DEFAULT_DATABASE_URL = 'file:./data/titan.db';
+/**
+ * The default when nothing sets `DATABASE_URL` (SPEC-001's boot contract).
+ *
+ * This MUST stay byte-identical to the `DATABASE_URL` in the committed `.env`.
+ * `tests/e2e/auth.spec.ts` counts session rows through this fallback while the
+ * dev server serves from `.env`, and DEC-013 records what a disagreement looks
+ * like: one database migrated, a different one served, and no error to say so.
+ * `tests/unit/db-pragmas.test.ts` asserts the two resolve to the same file.
+ *
+ * The `../` is load-bearing and must not be "tidied" to `./`. A relative sqlite
+ * `file:` URL is resolved against the directory holding `schema.prisma` — i.e.
+ * `prisma/` — by both the Prisma CLI and the generated client, NOT against the
+ * repository root and NOT against the process cwd. `file:./data/titan.db`
+ * therefore names `prisma/data/titan.db`, which is where this application's
+ * database actually lived until TASK-016 while `./data/` sat empty. SPEC-001
+ * puts persistent state at `./data/titan.db`, so the URL has to climb out of
+ * `prisma/` to reach it.
+ */
+export const DEFAULT_DATABASE_URL = 'file:../data/titan.db';
 
 /**
  * The datasource URL, with the single-connection pool pinned on.

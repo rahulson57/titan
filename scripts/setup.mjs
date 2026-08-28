@@ -35,6 +35,8 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
+  rmdirSync,
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
@@ -44,6 +46,23 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 /** Minimum runtime, per SPEC-001. `.nvmrc` pins the major line to 20. */
 const MIN_NODE = { major: 20, minor: 11 };
+
+/** SPEC-001's database file. Lives in `./data/`, at the repository root. */
+const DB_FILENAME = 'titan.db';
+
+/** SQLite keeps its journal and shared-memory files beside the database. */
+const DB_SIDECARS = ['', '-wal', '-shm', '-journal'];
+
+/**
+ * The DATABASE_URL this repo carried before TASK-016.
+ *
+ * It reads as "./data/ at the repo root" and is not: Prisma resolves a relative
+ * sqlite `file:` URL against the directory holding `schema.prisma`, so it
+ * actually named `prisma/data/titan.db`. Kept here so setup can recognise a
+ * tree still carrying it — in a generated `.env.local`, or as a real database
+ * file in the old location — and move it to where SPEC-001 says it belongs.
+ */
+const LEGACY_DATABASE_URL = 'file:./data/titan.db';
 
 const argv = new Set(process.argv.slice(2));
 const QUIET = argv.has('--quiet');
@@ -102,6 +121,14 @@ function checkNode(total) {
 
 // ---------------------------------------------------------------------------
 // 2. ./data/ — the only place persistent state lives
+//
+// This directory was decorative until TASK-016: DATABASE_URL said
+// `file:./data/titan.db`, Prisma read that relative to `prisma/`, and every
+// migration, seed and query went to `prisma/data/titan.db` while setup
+// carefully created an empty `./data/` next door. The URL now says
+// `file:../data/titan.db`, so this is the real location — and a tree that ran
+// the old setup still has its database in the old place, which is what
+// `relocateLegacyDatabase` is for.
 // ---------------------------------------------------------------------------
 
 function ensureDataDir(total) {
@@ -113,11 +140,94 @@ function ensureDataDir(total) {
     mkdirSync(dir, { recursive: true });
     ok('created data/');
   }
+  relocateLegacyDatabase(dir);
+}
+
+/**
+ * Move a database left behind at `prisma/data/titan.db` by the pre-TASK-016
+ * URL into `./data/`, sidecars and all.
+ *
+ * Deliberately conservative: it never overwrites. If both locations hold a
+ * database, this says so and touches neither — deciding which of two
+ * divergent databases is the real one is a judgement call, and a setup script
+ * making it silently is how work gets lost. Stop the dev server before running
+ * this: renaming a file another process holds open leaves that process writing
+ * to the moved inode.
+ */
+function relocateLegacyDatabase(dataDir) {
+  const legacy = join(ROOT, 'prisma', 'data', DB_FILENAME);
+  if (!existsSync(legacy)) return;
+
+  const target = join(dataDir, DB_FILENAME);
+  if (existsSync(target)) {
+    skip(
+      `prisma/data/${DB_FILENAME} also exists — moving nothing. data/${DB_FILENAME} ` +
+        'is the one DATABASE_URL now names; delete the other once you have checked it.',
+    );
+    return;
+  }
+
+  for (const suffix of DB_SIDECARS) {
+    if (existsSync(`${legacy}${suffix}`)) {
+      renameSync(`${legacy}${suffix}`, `${target}${suffix}`);
+    }
+  }
+  ok(
+    `moved prisma/data/${DB_FILENAME} -> data/${DB_FILENAME} ` +
+      '(pre-TASK-016 trees put it there; SPEC-001 puts it here)',
+  );
+
+  // Take the empty directory with it. Left behind, `prisma/data/` is the exact
+  // signpost that started this — a plausible-looking database location that
+  // holds nothing. `rmdirSync` refuses a non-empty directory, which is the
+  // guard: anything unexpected in there survives untouched.
+  try {
+    rmdirSync(dirname(legacy));
+  } catch {
+    /* not empty, or already gone — either way there is nothing to tidy */
+  }
 }
 
 // ---------------------------------------------------------------------------
 // 3. .env.local — generated locally, never fetched, never committed
 // ---------------------------------------------------------------------------
+
+/** The `DATABASE_URL="..."` value declared in an env file, or null. */
+function readDatabaseUrl(file) {
+  if (!existsSync(file)) return null;
+  return /^DATABASE_URL="(.+)"$/m.exec(readFileSync(file, 'utf8'))?.[1] ?? null;
+}
+
+/**
+ * Correct a `.env.local` still carrying the pre-TASK-016 DATABASE_URL.
+ *
+ * This matters more than it looks. `.env.local` overrides `.env` FOR THE APP
+ * but is invisible to the Prisma CLI (DEC-013), so a tree whose `.env.local`
+ * was generated before this fix would migrate `./data/titan.db` and serve
+ * `prisma/data/titan.db` — the exact split DEC-013 exists to prevent, with no
+ * error to announce it.
+ *
+ * Only the one known-stale literal is rewritten. A `.env.local` pointing
+ * somewhere else entirely is a deliberate local override and is left alone.
+ */
+function repairStaleEnvLocal(target, example) {
+  if (readDatabaseUrl(target) !== LEGACY_DATABASE_URL) return false;
+
+  const corrected = readDatabaseUrl(example);
+  if (!corrected || corrected === LEGACY_DATABASE_URL) return false;
+
+  const body = readFileSync(target, 'utf8').replace(
+    /^DATABASE_URL=.*$/m,
+    `DATABASE_URL="${corrected}"`,
+  );
+  writeFileSync(target, body, { mode: 0o600 });
+  ok(
+    `repaired a stale DATABASE_URL in .env.local (${LEGACY_DATABASE_URL} -> ${corrected}); ` +
+      'the old value resolved to prisma/data/, so the app and the Prisma CLI ' +
+      'would have used different databases',
+  );
+  return true;
+}
 
 function ensureEnvLocal(total) {
   step(3, total, 'Ensuring .env.local');
@@ -125,7 +235,9 @@ function ensureEnvLocal(total) {
   const example = join(ROOT, '.env.example');
 
   if (existsSync(target) && !FORCE_ENV) {
-    ok('.env.local already present (left untouched; --force-env to regenerate)');
+    if (!repairStaleEnvLocal(target, example)) {
+      ok('.env.local already present (left untouched; --force-env to regenerate)');
+    }
     return;
   }
 
