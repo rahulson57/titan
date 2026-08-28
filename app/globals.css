@@ -1,0 +1,792 @@
+/* =============================================================================
+   titan — design system tokens and primitives (SPEC-003)
+   =============================================================================
+
+   Medium-INSPIRED, never Medium-copied. Every value below was chosen for this
+   product; no stylesheet, asset, wordmark or font licence is lifted from
+   anywhere. The reading experience is reproduced from first principles.
+
+   ---------------------------------------------------------------------------
+   Why plain CSS custom properties rather than Tailwind's `@theme`
+   ---------------------------------------------------------------------------
+   SPEC-003's token table is headed "(app/globals.css, `@theme`)". `@theme` is
+   Tailwind v4's directive, and Tailwind is not a dependency of this repo.
+   Adding it would mean editing `package.json`, which SPEC-001 owns outright
+   ("this section owns the root runtime/config files listed below. No other
+   section may edit them") — so it is not available to this slice.
+
+   An `@theme` block without Tailwind is not inert-but-harmless, it is silently
+   broken: browsers drop unknown at-rules along with their contents, so every
+   token inside would simply not exist and every value SPEC-003 pins would fall
+   back to a UA default. `:root` declares exactly the same custom properties,
+   under exactly the same names, and actually applies them — and it is what
+   Tailwind's `@theme` compiles down to anyway. All seven of SPEC-003's
+   acceptance criteria are about computed values, and they are met here.
+
+   This interpretation is flagged in the proposal rather than assumed; the one
+   word "@theme" is the only part of SPEC-003 not taken literally, and it is
+   the only part that could not be taken literally without breaking SPEC-001.
+
+   ---------------------------------------------------------------------------
+   Token naming
+   ---------------------------------------------------------------------------
+   SPEC-003 gives composite values (`--text-body` = "21px / 1.58"). CSS cannot
+   decompose a custom property, so each composite is declared as its parts plus
+   a composite built FROM those parts. The parts are what rules consume and
+   what the tests read; the composite exists so the spec's token name resolves
+   to the spec's value, and it stays in sync by construction.
+   ============================================================================= */
+
+:root {
+  /* --- Typography ------------------------------------------------------- */
+
+  /* `--font-source-serif` / `--font-inter` are injected by next/font in
+     app/layout.tsx, which self-hosts both families at build time. The
+     fallbacks are not decoration: they are what renders if the font file has
+     not arrived, and both are metric-compatible enough to keep the first
+     paint from reflowing. SPEC-001 forbids a runtime network dependency, and
+     next/font satisfies that by downloading at build time and serving from
+     our own origin — nothing here fetches a font at runtime. */
+  --font-reading: var(--font-source-serif), 'Source Serif 4', Georgia, 'Times New Roman', serif;
+  --font-ui: var(--font-inter), Inter, system-ui, -apple-system, 'Segoe UI', sans-serif;
+
+  --text-body-size: 21px;
+  --text-body-leading: 1.58;
+  --text-body-tracking: -0.003em;
+  --text-body: var(--text-body-size) / var(--text-body-leading);
+
+  --text-h1-size: 42px;
+  --text-h1-leading: 1.18;
+  --text-h1-weight: 700;
+  --text-h1: var(--text-h1-size) / var(--text-h1-leading);
+
+  --text-meta-size: 14px;
+  --text-meta-leading: 1.4;
+  --text-meta: var(--text-meta-size) / var(--text-meta-leading);
+
+  /* Chrome sits between meta and reading: large enough to hit a comfortable
+     touch target, small enough that it never competes with the article. */
+  --text-ui-size: 15px;
+  --text-ui-leading: 1.45;
+
+  /* Article column width. 68ch of the reading face lands at roughly 65-75
+     characters per line, which is the range long-form legibility research
+     keeps pointing at. `ch` rather than a pixel width so the measure tracks
+     the font, including the 19px mobile step. */
+  --measure: 68ch;
+
+  /* Paragraph spacing inside the article. `em` so it scales with the step
+     down to 19px without a second breakpoint rule. */
+  --rhythm: 1.72em;
+
+  /* --- Color: light ----------------------------------------------------- */
+  --bg: #ffffff;
+  --fg: #242424;
+  --fg-muted: #6b6b6b;
+  --accent: #1a8917;
+  --border: #e6e6e6;
+
+  /* Derived surfaces. Kept as their own tokens so a component never invents a
+     colour inline, and so the contrast suite has a closed set to check. */
+  --bg-subtle: #fafafa;
+  --accent-contrast: #ffffff;
+
+  /* --- Space, radius, motion -------------------------------------------- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
+  --space-8: 64px;
+
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-pill: 999px;
+
+  /* Focus ring — SPEC-003: 2px accent outline, 2px offset, on every
+     interactive element, never removed without a replacement. */
+  --focus-width: 2px;
+  --focus-offset: 2px;
+
+  /* Images may break out of the measure, but never full-bleed (SPEC-003). */
+  --breakout-max: 1024px;
+
+  color-scheme: light;
+}
+
+/* Dark palette. Applied by adding `dark` to <html>, which the pre-paint script
+   in app/layout.tsx does before first paint — see lib/theme.ts. */
+.dark {
+  --bg: #0f0f0f;
+  --fg: #e8e8e8;
+  --fg-muted: #a3a3a3;
+  --accent: #4ade80;
+  --border: #2a2a2a;
+
+  --bg-subtle: #171717;
+  --accent-contrast: #0f0f0f;
+
+  color-scheme: dark;
+}
+
+/* =============================================================================
+   Base
+   ============================================================================= */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  /* Painting the canvas on <html> as well as <body> is what makes the
+     no-flash guarantee hold during navigation and overscroll: the UA paints
+     the root background before any body styles resolve. */
+  background-color: var(--bg);
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background-color: var(--bg);
+  color: var(--fg);
+  font-family: var(--font-ui);
+
+  /* The document's base size IS the reading size, and every piece of chrome
+     steps down from it explicitly (meta, buttons, tags, cards all set their
+     own). That way SPEC-003's "body text drops to 19px" below 640px is true
+     of the document body and of the article column at once, rather than being
+     true of one and merely implied of the other. */
+  font-size: var(--text-body-size);
+  line-height: var(--text-body-leading);
+
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* SPEC-003: 2px accent outline, 2px offset, on every interactive element.
+   `:focus-visible` rather than `:focus` so a pointer click does not leave a
+   ring behind, while keyboard focus always shows one. There is no
+   `outline: none` anywhere in this file — tests/unit/components.test.tsx
+   fails the build if one appears without a replacement ring. */
+:where(a, button, input, textarea, select, summary, [tabindex], [role='button']):focus-visible {
+  outline: var(--focus-width) solid var(--accent);
+  outline-offset: var(--focus-offset);
+  border-radius: var(--radius-sm);
+}
+
+/* Windows high-contrast mode drops author colours; `outline-color: Highlight`
+   keeps the ring visible there instead of silently vanishing. */
+@media (forced-colors: active) {
+  :where(a, button, input, textarea, select, summary, [tabindex], [role='button']):focus-visible {
+    outline-color: Highlight;
+  }
+}
+
+a {
+  color: inherit;
+  text-decoration-color: var(--border);
+  text-underline-offset: 2px;
+}
+
+a:hover {
+  text-decoration-color: currentColor;
+}
+
+img,
+picture,
+svg,
+video {
+  max-width: 100%;
+  height: auto;
+  display: block;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+/* Respect a reduced-motion preference everywhere, including the Skeleton
+   shimmer, which is the only animation this slice ships. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+/* Visually hidden, still announced. Used by icon-only controls. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* =============================================================================
+   Layout — the article column
+   ============================================================================= */
+
+.article-column {
+  /* SPEC-003: `--measure` centred, nothing full-bleed. `ch` resolves against
+     this element's own font, so the reading face must be set here and not
+     inherited from the UI stack, or the measure would be computed from the
+     wrong glyph width. */
+  font-family: var(--font-reading);
+  /* `width: 100%` with `box-sizing: border-box` is what keeps the padding
+     inside the measure rather than adding to it — without it, a viewport
+     narrower than 68ch would overflow horizontally between 640px and 768px,
+     which is precisely the failure the 375px overflow criterion guards. */
+  width: 100%;
+  max-width: var(--measure);
+  margin-inline: auto;
+  padding-inline: var(--space-4);
+}
+
+/* Images may break out of the measure up to 1024px — wider than the text,
+   never edge to edge. Scoped to both column classes because `Prose` carries
+   the measure itself and is used without an `.article-column` wrapper. */
+.article-column .breakout,
+.prose .breakout {
+  width: 100vw;
+  max-width: var(--breakout-max);
+  margin-inline: calc(50% - min(50vw, var(--breakout-max) / 2));
+}
+
+/* =============================================================================
+   Prose — the article body renderer wrapper
+   ============================================================================= */
+
+.prose {
+  font-family: var(--font-reading);
+  font-size: var(--text-body-size);
+  line-height: var(--text-body-leading);
+  letter-spacing: var(--text-body-tracking);
+  color: var(--fg);
+  /* Prose IS the article column — it carries the measure itself, so it must
+     not be nested inside `.article-column` or the two would pad twice. */
+  width: 100%;
+  max-width: var(--measure);
+  margin-inline: auto;
+  padding-inline: var(--space-4);
+}
+
+/* Vertical rhythm, as one rule rather than a margin on every element.
+   Order matters and specificity more so: both selectors below are (0,1,0), so
+   the owl wins by coming second. An earlier draft reset `margin` on each
+   element type instead — `.prose p { margin: 0 }` is (0,1,1) and silently beat
+   the owl, leaving the article with no paragraph spacing at all. Resetting on
+   `> *` keeps every element at the same specificity as the rule that spaces
+   them. */
+.prose > * {
+  margin: 0;
+}
+
+.prose > * + * {
+  margin-block-start: var(--rhythm);
+}
+
+.prose h1 {
+  font-size: var(--text-h1-size);
+  line-height: var(--text-h1-leading);
+  font-weight: var(--text-h1-weight);
+  letter-spacing: -0.014em;
+}
+
+.prose h2 {
+  font-family: var(--font-ui);
+  font-size: 30px;
+  line-height: 1.24;
+  font-weight: 700;
+  letter-spacing: -0.012em;
+}
+
+.prose h3 {
+  font-family: var(--font-ui);
+  font-size: 24px;
+  line-height: 1.3;
+  font-weight: 600;
+}
+
+.prose blockquote {
+  font-family: var(--font-reading);
+  padding-inline-start: var(--space-5);
+  border-inline-start: 3px solid var(--border);
+  color: var(--fg-muted);
+  font-style: italic;
+}
+
+.prose ul,
+.prose ol {
+  padding-inline-start: var(--space-6);
+}
+
+.prose li + li {
+  margin-block-start: calc(var(--rhythm) / 2);
+}
+
+.prose a {
+  color: inherit;
+  text-decoration: underline;
+  text-decoration-color: var(--accent);
+  text-decoration-thickness: 1px;
+}
+
+.prose code {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-size: 0.86em;
+  background-color: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.1em 0.32em;
+}
+
+.prose pre {
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, monospace;
+  font-size: 0.82em;
+  line-height: 1.5;
+  background-color: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: var(--space-4);
+  overflow-x: auto;
+}
+
+.prose pre code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+}
+
+.prose hr {
+  border: 0;
+  border-block-start: 1px solid var(--border);
+  margin-block: var(--space-7);
+}
+
+.prose figure {
+  /* The owl rule only resets DIRECT children, so a figure the editor nests
+     one level down (inside a list item, say) keeps the UA stylesheet's
+     `margin-inline: 40px` and renders narrower than the measure around it.
+     Zeroing it here makes a figure the full column width wherever it sits. */
+  margin-inline: 0;
+}
+
+.prose figcaption {
+  font-family: var(--font-ui);
+  font-size: var(--text-meta-size);
+  line-height: var(--text-meta-leading);
+  color: var(--fg-muted);
+  text-align: center;
+  margin-block-start: var(--space-3);
+}
+
+/* =============================================================================
+   Button
+   ============================================================================= */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  font-family: var(--font-ui);
+  font-size: var(--text-ui-size);
+  line-height: var(--text-ui-leading);
+  font-weight: 500;
+  border-radius: var(--radius-pill);
+  border: 1px solid transparent;
+  padding: var(--space-2) var(--space-4);
+  min-height: 36px;
+  cursor: pointer;
+  background: none;
+  color: var(--fg);
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+.btn[disabled],
+.btn[aria-disabled='true'] {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn--primary {
+  background-color: var(--accent);
+  color: var(--accent-contrast);
+  border-color: var(--accent);
+}
+
+.btn--primary:hover:not([disabled]) {
+  filter: brightness(0.94);
+}
+
+.btn--secondary {
+  border-color: var(--border);
+  color: var(--fg);
+}
+
+.btn--secondary:hover:not([disabled]) {
+  border-color: var(--fg-muted);
+}
+
+.btn--ghost {
+  color: var(--fg-muted);
+}
+
+.btn--ghost:hover:not([disabled]) {
+  color: var(--fg);
+  background-color: var(--bg-subtle);
+}
+
+.btn--sm {
+  font-size: 13px;
+  min-height: 30px;
+  padding: var(--space-1) var(--space-3);
+}
+
+.btn--lg {
+  font-size: 16px;
+  min-height: 44px;
+  padding: var(--space-3) var(--space-5);
+}
+
+/* Icon-only controls stay square and keep a 36px hit area. */
+.btn--icon {
+  padding: var(--space-2);
+  min-width: 36px;
+  border-radius: var(--radius-pill);
+}
+
+/* =============================================================================
+   Avatar
+   ============================================================================= */
+
+.avatar {
+  --avatar-size: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  inline-size: var(--avatar-size);
+  block-size: var(--avatar-size);
+  flex: 0 0 auto;
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+  background-color: var(--bg-subtle);
+  border: 1px solid var(--border);
+  font-family: var(--font-ui);
+  font-weight: 600;
+  color: var(--fg-muted);
+  user-select: none;
+}
+
+.avatar--sm {
+  --avatar-size: 24px;
+  font-size: 11px;
+}
+
+.avatar--md {
+  --avatar-size: 40px;
+  font-size: 15px;
+}
+
+.avatar--lg {
+  --avatar-size: 64px;
+  font-size: 22px;
+}
+
+.avatar__image {
+  inline-size: 100%;
+  block-size: 100%;
+  object-fit: cover;
+}
+
+/* =============================================================================
+   Tag
+   ============================================================================= */
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--fg-muted);
+  background-color: var(--bg-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: var(--space-1) var(--space-3);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.tag:hover {
+  color: var(--fg);
+  border-color: var(--fg-muted);
+}
+
+.tag--active {
+  color: var(--accent-contrast);
+  background-color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* =============================================================================
+   ThemeToggle
+   ============================================================================= */
+
+.theme-toggle {
+  color: var(--fg-muted);
+}
+
+.theme-toggle:hover {
+  color: var(--fg);
+}
+
+.theme-toggle__icon {
+  inline-size: 20px;
+  block-size: 20px;
+}
+
+/* =============================================================================
+   ArticleCard
+   ============================================================================= */
+
+.article-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-3);
+  padding-block: var(--space-5);
+  border-block-end: 1px solid var(--border);
+  font-family: var(--font-ui);
+}
+
+.article-card__byline {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-meta-size);
+  line-height: var(--text-meta-leading);
+  color: var(--fg-muted);
+}
+
+.article-card__author {
+  color: var(--fg);
+  font-weight: 500;
+  text-decoration: none;
+}
+
+.article-card__title {
+  font-family: var(--font-reading);
+  font-size: 22px;
+  line-height: 1.24;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0;
+}
+
+.article-card__link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.article-card__excerpt {
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--fg-muted);
+  margin: 0;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.article-card__footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  font-size: var(--text-meta-size);
+  line-height: var(--text-meta-leading);
+  color: var(--fg-muted);
+}
+
+.article-card__cover {
+  inline-size: 112px;
+  block-size: 112px;
+  object-fit: cover;
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-subtle);
+}
+
+@media (min-width: 768px) {
+  .article-card--with-cover {
+    grid-template-columns: minmax(0, 1fr) 112px;
+    grid-template-areas:
+      'byline cover'
+      'title cover'
+      'excerpt cover'
+      'footer cover';
+    align-items: start;
+    column-gap: var(--space-5);
+  }
+
+  .article-card--with-cover .article-card__byline {
+    grid-area: byline;
+  }
+  .article-card--with-cover .article-card__title {
+    grid-area: title;
+  }
+  .article-card--with-cover .article-card__excerpt {
+    grid-area: excerpt;
+  }
+  .article-card--with-cover .article-card__footer {
+    grid-area: footer;
+  }
+  .article-card--with-cover .article-card__cover {
+    grid-area: cover;
+    align-self: center;
+  }
+}
+
+/* =============================================================================
+   EmptyState
+   ============================================================================= */
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--space-3);
+  padding: var(--space-8) var(--space-4);
+  font-family: var(--font-ui);
+  color: var(--fg-muted);
+}
+
+.empty-state__title {
+  font-family: var(--font-reading);
+  font-size: 22px;
+  line-height: 1.3;
+  font-weight: 700;
+  color: var(--fg);
+  margin: 0;
+}
+
+.empty-state__description {
+  font-size: 16px;
+  line-height: 1.5;
+  margin: 0;
+  max-width: 46ch;
+}
+
+.empty-state__action {
+  margin-block-start: var(--space-2);
+}
+
+/* =============================================================================
+   Skeleton
+   ============================================================================= */
+
+.skeleton {
+  display: block;
+  background-color: var(--bg-subtle);
+  border-radius: var(--radius-sm);
+  background-image: linear-gradient(
+    90deg,
+    var(--bg-subtle) 0%,
+    var(--border) 50%,
+    var(--bg-subtle) 100%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.4s ease-in-out infinite;
+}
+
+.skeleton--text {
+  block-size: 1em;
+  border-radius: var(--radius-sm);
+}
+
+/* `rect` takes its size entirely from the `width`/`height` props, so it adds
+   no dimensions of its own — but it is declared rather than left implicit, so
+   every variant a component can emit has a rule to point at. */
+.skeleton--rect {
+  border-radius: var(--radius-sm);
+}
+
+.skeleton--circle {
+  border-radius: var(--radius-pill);
+  flex: 0 0 auto;
+}
+
+@keyframes skeleton-shimmer {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* =============================================================================
+   Responsive — 640 / 768 / 1024 (SPEC-003)
+   =============================================================================
+   Written as a max-width step rather than a min-width one because the 21px
+   measure is the design's default and 19px is the exception, and because the
+   `--text-body-size` override then cascades to every consumer of the token at
+   once — body, .prose and .article-column — instead of needing a rule each. */
+
+@media (max-width: 639.98px) {
+  :root {
+    /* SPEC-003: below 640px body text drops to 19px. */
+    --text-body-size: 19px;
+    /* 42px on a 375px viewport overflows the measure at almost any headline
+       length; the article title steps down with the body. */
+    --text-h1-size: 32px;
+  }
+
+  /* SPEC-003: below 640px the article column is `100% - 2rem`. */
+  .article-column,
+  .prose {
+    max-width: calc(100% - 2rem);
+    padding-inline: 0;
+  }
+
+  /* No full-bleed anywhere, so a breakout image is just the column width. */
+  .article-column .breakout,
+  .prose .breakout {
+    width: 100%;
+    max-width: 100%;
+    margin-inline: 0;
+  }
+
+  .prose pre {
+    /* Long tokens are the one thing that can still push the page wider than
+       the viewport; the scroll container keeps it inside. */
+    max-width: 100%;
+  }
+}
+
+@media (min-width: 1024px) {
+  .prose h1 {
+    letter-spacing: -0.018em;
+  }
+}
