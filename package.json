@@ -18,14 +18,16 @@
     "test:coverage": "vitest run --coverage",
     "db:migrate": "prisma migrate deploy",
     "db:seed": "tsx prisma/seed.ts",
-    "uploads:seed": "node scripts/uploads-seed.mjs"
+    "uploads:seed": "node scripts/uploads-seed.mjs",
+    "uploads:gc": "node scripts/uploads-gc.mjs"
   },
   "dependencies": {
     "@node-rs/argon2": "2.1.0",
     "@prisma/client": "6.1.0",
     "next": "15.5.24",
     "react": "19.1.0",
-    "react-dom": "19.1.0"
+    "react-dom": "19.1.0",
+    "sharp": "0.35.4"
   },
   "devDependencies": {
     "@axe-core/playwright": "4.10.1",
