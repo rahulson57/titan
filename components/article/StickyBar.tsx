@@ -55,7 +55,7 @@
  * whole reason those modules export providers — see `ClapButton.tsx`.
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState } from 'react';
 
 import { BookmarkButton } from './BookmarkButton';
 import { ClapButton } from './ClapButton';
@@ -72,7 +72,6 @@ export interface StickyBarProps {
 
 export function StickyBar({ title, headerId }: StickyBarProps) {
   const [shown, setShown] = useState(false);
-  const ref = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     const header = document.getElementById(headerId);
@@ -97,7 +96,6 @@ export function StickyBar({ title, headerId }: StickyBarProps) {
 
   return (
     <div
-      ref={ref}
       data-testid="sticky-bar"
       data-shown={shown}
       // `aria-hidden` tracks the visual state so the duplicated clap and

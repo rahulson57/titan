@@ -49,8 +49,12 @@ export interface ProgressBarProps {
 /**
  * Fraction of `element` that has been scrolled past, in 0..1.
  *
- * Exported for the unit surface: it is pure arithmetic over four numbers and
- * is where every off-by-one in this component would live.
+ * Split out and exported because it is where every off-by-one in this
+ * component would live, and because keeping it free of the DOM makes the
+ * reasoning below reviewable on its own terms. Its behaviour is asserted
+ * through the browser, in `tests/e2e/article-page.spec.ts` — this slice's file
+ * scope contains no unit-test file for `components/**`, so the arithmetic is
+ * documented here rather than pinned by a separate suite.
  *
  * The denominator is the element's height MINUS the viewport, because the last
  * viewport-worth of the body is on screen when the reader reaches the end —

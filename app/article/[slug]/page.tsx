@@ -119,7 +119,7 @@ function excerpt(bodyText: string): string {
  * which costs this product nothing, because it has no external network at all
  * (SPEC-001) and nothing off this machine can reach the page to scrape it.
  */
-export function fallbackOgImage(title: string, authorName: string): string {
+function fallbackOgImage(title: string, authorName: string): string {
   const escape = (value: string) =>
     value
       .replace(/&/g, '&amp;')
