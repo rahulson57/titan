@@ -19,29 +19,47 @@
  *    than on the absence of a placeholder, and the guard is itself under test
  *    at the bottom of this file. See TASK-022 for why that stopped being
  *    optional.
- *  - **"and from FTS results"** — `article_fts` exists (the initial migration
- *    creates the virtual table) but its write TRIGGERS are owned by SPEC-008
- *    too, and the migration says so in its own comment. Nothing in this slice
- *    writes the index, deliberately: the triggers key off `Article.status`, so
- *    publishing correctly here IS indexing the moment they land. Writing the
+ *  - **"and from FTS results"** — UNCONDITIONAL as of TASK-023, and the guard
+ *    it used to sit behind is deleted rather than repaired. Nothing in this
+ *    slice writes the index, deliberately: the triggers key off
+ *    `Article.status`, so publishing correctly here IS indexing. Writing the
  *    index by hand from `lib/content/publish.ts` would give the search corpus
  *    two authors that have to agree, and the failure mode is an article that is
  *    published but unfindable.
  *
- * The last two are therefore capability-guarded, with the real assertions
- * written out in full, naming TASK-007 as the unblocker. They arm themselves
- * when it lands and need no edit to this file. This is the shape
+ * The home-feed clause is therefore capability-guarded, with its real
+ * assertions written out in full; it armed itself when SPEC-008 landed and
+ * needed no edit to this file. This is the shape
  * `tests/e2e/draft-privacy.spec.ts` established and `tests/helpers/db.ts` calls
  * a capability probe.
  *
  * ── Amended by TASK-022 ───────────────────────────────────────────────────
  * The self-arming property above is only as good as what the guard is keyed
- * on, and one of these two was keyed on the wrong thing — it disarmed itself
- * again, in silence, months after the slice it was waiting for had landed.
- * A guard now keys on the CONTRACT the test consumes, and a guard-integrity
- * test at the bottom of this file fails loudly if one is disarmed while the
- * thing it waits for is present. An armed-but-skipped test that nobody can see
- * skipping is indistinguishable from a test that does not exist.
+ * on, and the home-feed guard was keyed on the wrong thing — it disarmed
+ * itself again, in silence, months after the slice it was waiting for had
+ * landed. A guard now keys on the CONTRACT the test consumes, and a
+ * guard-integrity test at the bottom of this file fails loudly if it is
+ * disarmed while the thing it waits for is present. An armed-but-skipped test
+ * that nobody can see skipping is indistinguishable from a test that does not
+ * exist.
+ *
+ * ── Amended by TASK-023: the FTS guard is gone ────────────────────────────
+ * `hasFtsTriggers()` asked whether anything maintained `article_fts` yet. The
+ * triggers had existed since TASK-007, but `lib/search/fts.ts` installed them
+ * LAZILY on the first call into the search module — so the answer depended on
+ * whether a search had already run against this database file. Under
+ * `npm test` (`vitest run && playwright test`) the unit suites always searched
+ * first and the guard armed; running `playwright test` on THIS FILE alone left
+ * it disarmed, and the test below silently did not run: 1 skipped in isolation
+ * versus 0 in the gate, on one commit.
+ *
+ * That is not a capability the suite should wait on, it is a bootstrap order
+ * this suite should not be able to observe. TASK-023 moved the DDL into
+ * `prisma/migrations/20260828190000_fts_write_triggers/`, so the triggers now
+ * exist in every database `prisma migrate deploy` has touched. The guard would
+ * then be a predicate that can never be false — which is strictly worse than
+ * no guard, because it looks like protection while asserting nothing. So it is
+ * deleted, and the test runs the same way in the gate and in isolation.
  */
 
 import { expect, test, type Page } from '@playwright/test';
@@ -105,30 +123,12 @@ function hasHomeFeed(source: string | null = homePageSource()): boolean {
   return source !== null && source.includes(`data-testid="${HOME_FEED_TESTID}"`);
 }
 
-/** True once SPEC-008's triggers maintain `article_fts`. */
-async function hasFtsTriggers(): Promise<boolean> {
-  const rows = await getDb().$queryRawUnsafe<Array<{ name: string }>>(
-    "SELECT name FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'Article'",
-  );
-  return rows.length > 0;
-}
-
 const WAITING_ON_FEED =
   `app/page.tsx does not render data-testid="${HOME_FEED_TESTID}", so there is no home feed for ` +
   'a withdrawn article to disappear from. This guard is ARMED as of TASK-022 — if you are reading ' +
   'this as a live skip reason, the feed contract was removed or renamed, and the guard-integrity ' +
   'test at the bottom of this file will have gone red alongside it. Fix the feed or update ' +
   'HOME_FEED_TESTID; do not delete either check.';
-
-const WAITING_ON_FTS =
-  'no write triggers on "Article" yet, so nothing maintains article_fts. NOTE (TASK-022, message ' +
-  'only — the predicate is unchanged): TASK-007 landed these triggers, but lib/search/fts.ts ' +
-  'installs them LAZILY on the first call into the search module, not in a migration. `npm test` ' +
-  'runs vitest before playwright and the unit search suites install them, so this arms in the ' +
-  'gate; running `playwright test` on this file ALONE skips it, because nothing has searched yet. ' +
-  'That is a property of where the DDL lives, not a missing slice — do not read this as ' +
-  '“SPEC-008 has not landed”. Raised with the coordinator rather than repaired here: the fix is ' +
-  'in lib/search/fts.ts or prisma/migrations/, neither of which is this task’s scope.';
 
 const createdEmails: string[] = [];
 
@@ -390,9 +390,9 @@ test.describe('SPEC-007 — publishing', () => {
   });
 
   test('an unpublished article leaves the FTS index', async ({ page }) => {
-    const armed = await hasFtsTriggers();
-    test.skip(!armed, WAITING_ON_FTS);
-
+    // No capability guard: the write triggers are created by
+    // prisma/migrations/20260828190000_fts_write_triggers, so every database
+    // this suite can reach has them. See the header for what was here before.
     const articleId = await openDraft(page, GOOD_BODY);
     await addTag(page, 'craft');
     await page.getByTestId('publish-button').click();
@@ -411,8 +411,9 @@ test.describe('SPEC-007 — publishing', () => {
      * the triggers behaved.
      *
      * It went unnoticed because the whole test was skipped until SPEC-008's
-     * triggers landed: `hasFtsTriggers()` returned false, so the assertion had
-     * never once executed. Arming it is what exposed it.
+     * triggers landed: the capability guard TASK-023 has since deleted read
+     * false, so the assertion had never once executed. Arming it is what
+     * exposed it.
      *
      * Narrowing the count to `a."id" = articleId` asks the question the test's
      * own name asks. It is also strictly stronger than a global count: a
