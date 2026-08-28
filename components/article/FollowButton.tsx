@@ -6,12 +6,20 @@
 /**
  * The follow toggle (SPEC-009).
  *
- * Rendered twice on this page — once in the header's author row, once in the
- * footer author card — so it takes the same provider-plus-consumer shape as
- * the clap and bookmark controls. Two independent hooks would let the header
- * say "Following" while the card below it still offers "Follow", and both
- * would carry their own follower count. See `ClapButton.tsx` for the argument
- * in full.
+ * Rendered twice on the article page — once in the header's author row, once
+ * in the footer author card — so it takes the same provider-plus-consumer
+ * shape as the clap and bookmark controls. Two independent hooks would let the
+ * header say "Following" while the card below it still offers "Follow", and
+ * both would carry their own follower count. See `ClapButton.tsx` for the
+ * argument in full.
+ *
+ * ── Two surfaces, one control (TASK-021) ─────────────────────────────────
+ * It is also the control in `ProfileHeader`'s action slot on `/@[handle]`.
+ * That reuse is the point rather than a convenience: SPEC-009 makes a
+ * self-follow a 400 `SelfFollowError`, and a second follow control with its
+ * own action would be a second place for that invariant to be got right or
+ * wrong. The only thing that was article-shaped here was the anonymous
+ * sign-in destination — see `returnTo` below.
  *
  * ── Self-follow ──────────────────────────────────────────────────────────
  * SPEC-009 makes it a 400 `SelfFollowError`. The control is not rendered at
@@ -41,7 +49,7 @@ import {
 
 import { followAction } from '../../app/article/[slug]/actions';
 import type { FollowState } from '../../lib/engage/follow';
-import { articleHref, signInHref } from '../../lib/routes';
+import { signInHref } from '../../lib/routes';
 
 interface FollowContextValue extends FollowState {
   signedIn: boolean;
@@ -58,7 +66,25 @@ export interface FollowProviderProps {
   /** The author being followed — never the viewer; the actor comes from the cookie. */
   authorId: string;
   authorName: string;
-  slug: string;
+  /**
+   * Where an anonymous viewer lands after signing in — an already-built href,
+   * not an identifier this component turns into one.
+   *
+   * It used to be `slug: string`, from which the provider built
+   * `signInHref(articleHref(slug))`. That single line was the only thing tying
+   * SPEC-009's follow control to the article surface: the action takes an
+   * author id and nothing else, and `lib/engage/follow.ts` never knew what page
+   * it was on. A profile has no article to send anybody back to, so the caller
+   * now names the destination and the provider stays surface-agnostic —
+   * `articleHref(slug)` from `/article/[slug]`, `profileHref(handle)` from
+   * `/@[handle]`.
+   *
+   * Deliberately a route-helper *result* rather than a raw string the caller
+   * assembled: `lib/routes.ts` stays the only place a route is spelled, and
+   * `signInHref` below stays the only place the `?next=` contract is spelled.
+   * Neither half is re-implemented here.
+   */
+  returnTo: string;
   signedIn: boolean;
   isSelf: boolean;
   initialFollowing: boolean;
@@ -69,7 +95,7 @@ export interface FollowProviderProps {
 export function FollowProvider({
   authorId,
   authorName,
-  slug,
+  returnTo,
   signedIn,
   isSelf,
   initialFollowing,
@@ -90,7 +116,7 @@ export function FollowProvider({
       : state.followerCount + 1,
   }));
 
-  const signInTarget = useMemo(() => signInHref(articleHref(slug)), [slug]);
+  const signInTarget = useMemo(() => signInHref(returnTo), [returnTo]);
 
   const toggle = useCallback(() => {
     if (!signedIn || isSelf) return;

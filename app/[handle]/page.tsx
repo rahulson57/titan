@@ -47,6 +47,7 @@ import { notFound } from 'next/navigation';
 import type { CSSProperties } from 'react';
 import type { Metadata } from 'next';
 
+import { FollowButton, FollowProvider } from '../../components/article/FollowButton';
 import { ProfileHeader } from '../../components/profile/ProfileHeader';
 import { ProfileTabs, parseProfileTab, profileTabHref, type ProfileTab } from '../../components/profile/ProfileTabs';
 import { excerptFrom } from '../../components/feed/FeedList';
@@ -59,8 +60,9 @@ import {
   countArticlesByAuthor,
   listArticlesByAuthor,
 } from '../../lib/db/articles';
-import { getFollowerCount, listBookmarkedArticles } from '../../lib/db/social';
+import { listBookmarkedArticles } from '../../lib/db/social';
 import { findUserByHandle, type UserRecord } from '../../lib/db/users';
+import { readFollowState } from '../../lib/engage/follow';
 import { HOME, articleHref, profileHref } from '../../lib/routes';
 
 /** Live counts and a viewer-dependent tab. Never statically rendered. */
@@ -212,8 +214,15 @@ export default async function ProfilePage({ params, searchParams }: PageProps) {
 
   const author = { name: user.name, handle: user.handle, avatarPath: user.avatarPath };
 
-  const [followerCount, publishedCount, page] = await Promise.all([
-    getFollowerCount(user.id),
+  // `readFollowState` is SPEC-009's read and it returns BOTH halves this page
+  // needs — the public `COUNT(*)` the header prints, and whether this viewer is
+  // one of them. It is deliberately used in place of the bare
+  // `getFollowerCount` this page used to call (it is the same query: see
+  // `lib/engage/follow.ts`), so the number beside the button and the number in
+  // the stats line cannot disagree, and so no second follower-count read is
+  // introduced for the control.
+  const [follow, publishedCount, page] = await Promise.all([
+    readFollowState(session?.user ?? null, user.id),
     countArticlesByAuthor(user.id, ARTICLE_STATUS.PUBLISHED),
     loadTab(user, tab, cursor),
   ]);
@@ -251,13 +260,38 @@ export default async function ProfilePage({ params, searchParams }: PageProps) {
         avatarPath={user.avatarPath}
         coverPath={user.coverPath}
         socials={user.socials}
-        followerCount={followerCount}
+        followerCount={follow.followerCount}
         publishedCount={publishedCount}
         isOwner={isOwner}
-        // The Follow / Following control is SPEC-009's mutation (TASK-009) and
-        // is left unfilled deliberately rather than duplicated here. When
-        // `isOwner`, `ProfileHeader` does not consult this slot at all, so a
-        // self-follow button cannot appear however it is later filled.
+        // SPEC-010's action region, filled with SPEC-009's own control rather
+        // than a second one built here (TASK-021). `followAction` takes an
+        // author id and nothing else and does not revalidate a path, so it
+        // works from this surface unchanged; the one article-shaped thing it
+        // carried was the anonymous sign-in destination, now `returnTo`.
+        //
+        // TWO independent things keep a self-follow off this page, and both
+        // are kept on purpose:
+        //   1. `ProfileHeader` does not consult this slot at all when
+        //      `isOwner` — the structural half, which no caller can undo.
+        //   2. `isSelf` here makes `FollowButton` render `null` regardless —
+        //      the same rule the article page relies on.
+        // Either alone would be correct today. Together, removing one does not
+        // silently put a "Follow yourself" button on somebody's own profile.
+        action={
+          <FollowProvider
+            authorId={user.id}
+            authorName={user.name}
+            // No article to come back to on a profile — this is the whole
+            // reason the prop is a destination and not a slug.
+            returnTo={profileHref(user.handle)}
+            signedIn={session?.user != null}
+            isSelf={isOwner}
+            initialFollowing={follow.following}
+            initialFollowerCount={follow.followerCount}
+          >
+            <FollowButton compact />
+          </FollowProvider>
+        }
       />
 
       <ProfileTabs handle={user.handle} active={tab} isOwner={isOwner} />
