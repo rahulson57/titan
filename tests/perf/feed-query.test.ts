@@ -112,12 +112,16 @@ describe.skipIf(!READY)(
         env: { ...process.env, DATABASE_URL: db.url },
       });
 
+      // DEC-009: SPEC-002's "500 articles" is the PUBLISHED count, which is
+      // what the budget is measured against. The seed corpus is 540 rows
+      // (500 PUBLISHED + 40 DRAFT) per SPEC-004; only the published half is
+      // ever on a feed page, so the count is scoped rather than loosened.
       const counted = await db.client.$queryRawUnsafe<Array<{ n: number }>>(
-        'SELECT COUNT(*) AS n FROM "Article"',
+        `SELECT COUNT(*) AS n FROM "Article" WHERE status = 'PUBLISHED'`,
       );
       expect(
         Number(counted[0]?.n),
-        'the 50/500/2000 corpus is what the budget is stated against',
+        'the 50/500-published/2000 corpus is what the budget is stated against',
       ).toBe(500);
     });
 

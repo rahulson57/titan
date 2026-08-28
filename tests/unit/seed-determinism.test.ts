@@ -168,11 +168,19 @@ describe.skipIf(!READY)(
       // SPEC-002 states the budgets against "50 users / 500 articles / 2 000
       // claps". A smaller corpus would make every p95 below pass for the
       // wrong reason.
+      //
+      // DEC-009: that "500 articles" is the PUBLISHED count, not the total.
+      // SPEC-004 seeds 540 rows (500 PUBLISHED + 40 DRAFT) and its own
+      // criterion says so outright; the budgets are stated against the
+      // published corpus, so the assertion is scoped by status rather than
+      // relaxed. The total is pinned too, so neither half can drift.
       db ??= await createTestDatabase();
       runSeed(db.url);
       const { User, Article, Clap } = await snapshot(db);
       expect(User.length).toBe(50);
-      expect(Article.length).toBe(500);
+      expect(Article.filter((row) => row.status === 'PUBLISHED')).toHaveLength(500);
+      expect(Article.filter((row) => row.status === 'DRAFT')).toHaveLength(40);
+      expect(Article.length).toBe(540);
       expect(Clap.length).toBe(2000);
     });
   },

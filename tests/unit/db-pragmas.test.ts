@@ -64,10 +64,17 @@ describe.skipIf(!READY)(`SPEC-001 — the app connection runs in WAL mode${READY
     // SQLite defaults foreign_keys OFF per connection. SPEC-004 relies on
     // cascade behaviour, which silently does nothing without this.
     db ??= await createTestDatabase();
-    const rows = await db.client.$queryRawUnsafe<Array<{ foreign_keys: number }>>(
+    // DEC-012: the Prisma SQLite driver maps INTEGER to BigInt over
+    // $queryRawUnsafe, so this pragma answers `1n`, not `1`. The generic is
+    // widened as well as the value coerced — a type that says `number` while
+    // the driver returns `bigint` is the latent lie that produced the original
+    // failure. Do not "simplify" the Number() away. It cannot weaken the gate:
+    // Number(undefined) is NaN, Number(null) and Number(0n) are 0, and all
+    // three still fail this assertion.
+    const rows = await db.client.$queryRawUnsafe<Array<{ foreign_keys: number | bigint }>>(
       'PRAGMA foreign_keys',
     );
-    expect(rows[0]?.foreign_keys).toBe(1);
+    expect(Number(rows[0]?.foreign_keys)).toBe(1);
   });
 
   it('is a plain local file, not an attached or remote source', async () => {
