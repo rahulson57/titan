@@ -40,6 +40,7 @@
 
 import { expect, test, type Page } from '@playwright/test';
 
+import { BASE_URL } from '../../playwright.config';
 import { disconnectDb, getDb } from '../../lib/db/client';
 import { deleteUser, findUserByEmail } from '../../lib/db/users';
 
@@ -368,7 +369,13 @@ test.describe('SPEC-005 — middleware routing', () => {
     await page.getByRole('button', { name: /^sign in$/i }).click();
 
     // Landed on our own root, not on the attacker's host.
+    //
+    // Compared against the harness origin rather than a literal `localhost:3000`
+    // (SPEC-001 v3): the harness binds `process.env.PORT ?? 3000`, so a literal
+    // would fail under a provisioned PORT for a reason that has nothing to do
+    // with open redirects. What the guard asserts is unchanged — the browser
+    // ended on OUR host, not the attacker's.
     await page.waitForURL('/');
-    expect(new URL(page.url()).host).toBe('localhost:3000');
+    expect(new URL(page.url()).host).toBe(new URL(BASE_URL).host);
   });
 });

@@ -17,7 +17,14 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import playwrightConfig, { PORT, WEB_SERVER, appIsBootable } from '../../playwright.config';
+import playwrightConfig, {
+  BASE_URL,
+  PORT,
+  WEB_SERVER,
+  appIsBootable,
+  devCommandForPort,
+  resolveHarnessPort,
+} from '../../playwright.config';
 import vitestConfig from '../../vitest.config';
 import { hasDbClient, hasMigratableSchema, hasSeedScript } from '../helpers/db';
 
@@ -78,11 +85,46 @@ describe('SPEC-002 — Playwright is configured against flakiness', () => {
   });
 });
 
-describe('SPEC-002 — the web server is bound to port 3000', () => {
-  it('states the contract on port 3000 at the canonical URL', () => {
-    expect(PORT).toBe(3000);
-    expect(WEB_SERVER.url).toBe('http://localhost:3000');
-    expect(WEB_SERVER.url).toContain(`:${PORT}`);
+describe('SPEC-002 — the web server is bound to the harness port', () => {
+  /**
+   * SPEC-001 v3 replaced the literal this block used to assert:
+   *
+   * > `npm run dev` stays exactly `next dev -p 3000`; the TEST HARNESS
+   * > (playwright webServer + specs) binds `process.env.PORT ?? 3000` so
+   * > concurrent worktrees/gates never collide.
+   *
+   * The property being guarded is unchanged and is not weaker: the harness
+   * binds ONE port, explicitly, and every URL in the config is built from that
+   * same value. Pinning the constant `3000` would now assert the opposite of
+   * the spec. `npm run dev` itself is still pinned to `next dev -p 3000` —
+   * by tests/unit/constraints.test.ts and tests/e2e/boot.spec.ts, which own
+   * that half and are untouched.
+   */
+  it('binds `process.env.PORT ?? 3000`, and states it once as the canonical URL', () => {
+    expect(PORT).toBe(resolveHarnessPort(process.env.PORT));
+    expect(WEB_SERVER.url).toBe(`http://localhost:${PORT}`);
+    expect(WEB_SERVER.url).toBe(BASE_URL);
+  });
+
+  it('falls back to 3000 when nothing provisions a PORT', () => {
+    // The human-facing default. A bare `npm test` on a developer machine must
+    // behave exactly as it did before the harness became port-agnostic, so
+    // this is asserted rather than assumed.
+    expect(resolveHarnessPort(undefined)).toBe(3000);
+    expect(resolveHarnessPort('')).toBe(3000);
+  });
+
+  it('honours a provisioned PORT', () => {
+    expect(resolveHarnessPort('3270')).toBe(3270);
+  });
+
+  it('refuses a PORT that is not a port, rather than building a URL nothing answers', () => {
+    // A malformed PORT would otherwise surface 60 seconds later as a webServer
+    // timeout, which says nothing about the actual cause.
+    expect(() => resolveHarnessPort('not-a-port')).toThrow(/not a TCP port/);
+    expect(() => resolveHarnessPort('0')).toThrow(/not a TCP port/);
+    expect(() => resolveHarnessPort('70000')).toThrow(/not a TCP port/);
+    expect(() => resolveHarnessPort('3000.5')).toThrow(/not a TCP port/);
   });
 
   it('waits for an HTTP response, not merely for the socket to bind', () => {
@@ -93,8 +135,26 @@ describe('SPEC-002 — the web server is bound to port 3000', () => {
     expect(WEB_SERVER).not.toHaveProperty('port');
   });
 
-  it('boots the app through the project scripts, not an ad-hoc command', () => {
-    expect(WEB_SERVER.command).toMatch(/^npm run (dev|build && npm run start|start)$/);
+  it('boots the app with the project dev script, with only the port substituted', () => {
+    // The property this has always guarded is that the harness boots the app
+    // the way a human does, rather than an ad-hoc command that could drift
+    // from the documented one and go green against something users never run.
+    //
+    // It used to say that as the literal string `npm run dev`. It cannot any
+    // more: `npm run dev` is sealed at `next dev -p 3000`, and running THAT
+    // under a provisioned PORT is exactly the collision SPEC-001 v3 removed.
+    // So the relationship is asserted instead of the string — the command is
+    // `scripts.dev` with its port swapped, and nothing else.
+    expect(WEB_SERVER.command).toBe(devCommandForPort(pkg.scripts.dev ?? 'next dev', PORT));
+    expect(WEB_SERVER.command).toContain(`-p ${PORT}`);
+    expect(WEB_SERVER.command).not.toMatch(/-p\s+\d+\s+-p\s/);
+  });
+
+  it('substitutes the port into the dev script rather than appending a second one', () => {
+    // Stated on fixed input so the transform is pinned independently of
+    // whatever `package.json` happens to say today.
+    expect(devCommandForPort('next dev -p 3000', 4100)).toBe('npx next dev -p 4100');
+    expect(devCommandForPort('next dev', 4100)).toBe('npx next dev -p 4100');
   });
 
   it('allows the boot contract its full 60 seconds', () => {
@@ -124,8 +184,8 @@ describe('SPEC-002 — the web server is bound to port 3000', () => {
     expect(WEB_SERVER.reuseExistingServer).toBe(false);
   });
 
-  it('shuts the server tree down gracefully instead of orphaning it on 3000', () => {
-    // `npm run dev` is npm -> next -> next-server. Killing the group without
+  it('shuts the server tree down gracefully instead of orphaning it on the port', () => {
+    // The dev command is npx -> next -> next-server. Killing the group without
     // asking first can leave the grandchild holding the port, which turns into
     // the *next* run failing to bind.
     expect(WEB_SERVER.gracefulShutdown).toEqual({ signal: 'SIGTERM', timeout: 5_000 });
@@ -151,14 +211,18 @@ describe('SPEC-002 — the web server is bound to port 3000', () => {
     // app/layout.tsx and TASK-007 lands app/page.tsx.
     if (appIsBootable()) {
       expect(playwrightConfig.webServer).toBeDefined();
-      expect(playwrightConfig.webServer).toMatchObject({ url: 'http://localhost:3000' });
+      expect(playwrightConfig.webServer).toMatchObject({ url: BASE_URL });
     } else {
       expect(playwrightConfig.webServer).toBeUndefined();
     }
   });
 
   it('routes browser tests at the same origin the server binds', () => {
-    expect(playwrightConfig.use?.baseURL).toBe('http://localhost:3000');
+    // One derivation, three consumers. If these ever disagree the suite drives
+    // a browser at an origin nothing is listening on, and every e2e failure
+    // reads as a product bug.
+    expect(playwrightConfig.use?.baseURL).toBe(WEB_SERVER.url);
+    expect(playwrightConfig.use?.baseURL).toBe(BASE_URL);
   });
 });
 
