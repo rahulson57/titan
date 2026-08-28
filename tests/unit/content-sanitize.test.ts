@@ -684,4 +684,82 @@ describe('SPEC-007 — the whole pipeline against one hostile document', () => {
     expect(b.bodyText).toBe(a.bodyText);
     expect(b.readingMinutes).toBe(a.readingMinutes);
   });
+
+  /**
+   * Every object in a sanitised document has `Object.prototype`.
+   *
+   * This looks like a test about nothing, and it is the regression test for the
+   * worst bug found in this slice. `components/editor/Editor.tsx` sends the
+   * document to a Server Action, and ProseMirror builds each node's `attrs`
+   * with `Object.create(null)` — so `editor.getJSON()` hands back values whose
+   * prototype is `null`. React's Server Action serializer encodes plain objects
+   * and arrays; a null-prototype value it drops SILENTLY. The action returns
+   * 200, the editor shows `Saved`, and every attribute in the article is gone.
+   *
+   * What that costs is not cosmetic, because the attributes ARE the content:
+   * `heading.attrs.level` is the only thing separating an H3 from an H2, an
+   * `image` that loses `attrs.src` fails the sanitiser's `{ ok: false }` check
+   * and the picture disappears from the article, and a `link` mark stripped of
+   * `attrs.href` stops being a link. Each one degrades into something that
+   * still looks like a document, which is why it survived until the keyboard
+   * suite compared stored HTML against the DOM.
+   *
+   * `sanitizeDoc` is what makes the payload safe to send — it rebuilds the
+   * document from fresh object literals instead of forwarding the editor's own
+   * nodes — so this asserts the property the fix depends on rather than the
+   * line of code that uses it. Asserted structurally, on a document that
+   * carries an attribute of every kind the schema allows.
+   */
+  it('produces only plain-prototype objects, so Server Action serialization keeps attrs', () => {
+    const doc = sanitizeDoc({
+      type: 'doc',
+      content: [
+        {
+          type: 'heading',
+          attrs: { level: 3 },
+          content: [{ type: 'text', text: 'A heading' }],
+        },
+        {
+          type: 'paragraph',
+          content: [
+            {
+              type: 'text',
+              text: 'a link',
+              marks: [{ type: 'link', attrs: { href: 'https://example.com/essay' } }],
+            },
+          ],
+        },
+        { type: 'image', attrs: { src: '/uploads/x.webp', alt: 'alt text' } },
+        { type: 'codeBlock', attrs: { language: 'ts' }, content: [{ type: 'text', text: 'x' }] },
+        { type: 'orderedList', attrs: { start: 3 }, content: [] },
+      ],
+    });
+
+    const nullPrototypes: string[] = [];
+    const walk = (value: unknown, path: string) => {
+      if (Array.isArray(value)) {
+        value.forEach((entry, index) => walk(entry, `${path}[${index}]`));
+        return;
+      }
+      if (typeof value !== 'object' || value === null) return;
+      if (Object.getPrototypeOf(value) !== Object.prototype) nullPrototypes.push(path);
+      for (const [key, entry] of Object.entries(value)) walk(entry, `${path}.${key}`);
+    };
+    walk(doc, 'doc');
+
+    expect(
+      nullPrototypes,
+      'these values would be dropped silently crossing the Server Action boundary',
+    ).toEqual([]);
+
+    // And the walk actually reached the attributes it is protecting, so a
+    // sanitiser that stripped every `attrs` could not pass this vacuously.
+    const heading = doc.content?.[0];
+    expect(heading?.attrs?.level).toBe(3);
+    expect(doc.content?.[1]?.content?.[0]?.marks?.[0]?.attrs?.href).toBe(
+      'https://example.com/essay',
+    );
+    expect(doc.content?.[2]?.attrs?.src).toBe('/uploads/x.webp');
+    expect(doc.content?.[3]?.attrs?.language).toBe('ts');
+  });
 });

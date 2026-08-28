@@ -247,7 +247,32 @@ export function Editor({ draft }: EditorProps) {
       // Pulled from the editor here, not captured when the keystroke fired:
       // a debounced save closing over a two-second-old document is the classic
       // autosave bug, and it reports success while storing stale text.
-      bodyJson: editorRef.current?.getJSON() ?? sanitizeDoc(draft.bodyJson),
+      //
+      // `sanitizeDoc` wraps the pull, and that is a CORRECTNESS requirement at
+      // this boundary rather than a second helping of the security one (the
+      // server sanitises again, and that call is the boundary). ProseMirror
+      // builds every node's `attrs` with `Object.create(null)`, so `getJSON()`
+      // hands back objects whose prototype is `null` — verified in the browser.
+      // React's Server Action serializer encodes only plain objects and arrays,
+      // and it drops a null-prototype value SILENTLY: the action still
+      // succeeds, so the save reports `Saved` while every attribute in the
+      // document has quietly disappeared.
+      //
+      // The damage is not cosmetic. `attrs.level` is what separates an H3 from
+      // an H2, `attrs.src` is the whole of an image (a node with no `src` is
+      // dropped by the sanitiser, so the image vanishes), and a link mark
+      // without `attrs.href` stops being a link. All of them degrade to
+      // something plausible-looking, which is why this survived until the
+      // keyboard suite compared the STORED html against the DOM.
+      //
+      // `sanitizeDoc` fixes it because it rebuilds the document out of fresh
+      // object literals rather than passing the editor's own nodes through, so
+      // what crosses the wire has `Object.prototype` throughout. It also earns
+      // its walk twice over: it is the same function the server runs, so the
+      // client cannot send a document the server would reshape, and the cost is
+      // one walk per SAVE — not per keystroke, which is the budget that matters
+      // (see `editorRef` above).
+      bodyJson: sanitizeDoc(editorRef.current?.getJSON() ?? draft.bodyJson),
       coverPath: draft.coverPath,
       tags: tagsRef.current,
     };
@@ -402,6 +427,23 @@ export function Editor({ draft }: EditorProps) {
       await schedulerRef.current?.flush();
       const result = await publish(id, { title, tags });
       if (result.ok) {
+        // Adopt the version the transition produced, BEFORE anything else can
+        // schedule a save.
+        //
+        // Publishing writes the row, so the server's `version` advances — and
+        // the editor is holding the number from its last `saveDraft`. Leave it
+        // stale and the author's very next keystroke debounces into a save
+        // carrying a version the server has already moved past, which is
+        // exactly the 409 the conflict rule is built to raise. The banner would
+        // then accuse the author of a concurrent edit that never happened, in
+        // the one situation where they are provably the only writer.
+        //
+        // `publishDraft` returns `version` for this purpose (see `PublishOk`),
+        // and its own header notes the symmetric hazard: it validates before it
+        // writes so a REJECTED publish leaves the counter untouched. Both
+        // halves are needed — one keeps a failed publish from desyncing the
+        // editor, this keeps a successful one from doing it.
+        versionRef.current = result.version;
         setPublishErrors([]);
         setStatus('PUBLISHED');
         setSlug(result.slug);
@@ -422,6 +464,10 @@ export function Editor({ draft }: EditorProps) {
     try {
       const result = await unpublish(id);
       if (result.ok) {
+        // Same reason as `onPublish` above: unpublishing is a write, so it
+        // advances `version` too, and an author who unpublishes and then keeps
+        // editing must not be told their own draft conflicts with itself.
+        versionRef.current = result.version;
         setStatus('DRAFT');
         router.refresh();
       } else {
@@ -452,15 +498,49 @@ export function Editor({ draft }: EditorProps) {
             {status === 'PUBLISHED' ? 'Published' : 'Draft'}
           </span>
 
+          {/*
+            A published article keeps BOTH affordances, and the republish half
+            is not a convenience.
+
+            SPEC-007's state machine lists `PUBLISHED -> PUBLISHED (edit)` as a
+            transition in its own right, beside unpublish and delete, and
+            `publishDraft` implements it — its header says so. Without a control
+            that reaches it, the transition exists on the server and is
+            unreachable from the one surface that owns publishing.
+
+            It also closes a guard hole that is easy to miss. The publish guards
+            (title non-empty, `bodyText` >= 50, 1-5 tags) run on the PUBLISH
+            path only; autosave deliberately does not enforce them, because a
+            draft is allowed to be half-written mid-sentence. So an author
+            editing a live article can autosave it down to ten characters and it
+            stays PUBLISHED with a body that would have been refused at the
+            door. Republish is where those guards get re-run against what the
+            article has actually become.
+
+            Same handler as the first publish, deliberately: `publishDraft`
+            already distinguishes the two cases and freezes `slug` and
+            `publishedAt` after the first one, so a second author-facing path
+            would be a second place for that rule to be got wrong.
+          */}
           {status === 'PUBLISHED' ? (
-            <Button
-              variant="secondary"
-              data-testid="unpublish-button"
-              disabled={publishing}
-              onClick={() => void onUnpublish()}
-            >
-              Unpublish
-            </Button>
+            <>
+              <Button
+                variant="secondary"
+                data-testid="unpublish-button"
+                disabled={publishing}
+                onClick={() => void onUnpublish()}
+              >
+                Unpublish
+              </Button>
+              <Button
+                variant="primary"
+                data-testid="publish-button"
+                disabled={publishing}
+                onClick={() => void onPublish()}
+              >
+                Republish
+              </Button>
+            </>
           ) : (
             <Button
               variant="primary"

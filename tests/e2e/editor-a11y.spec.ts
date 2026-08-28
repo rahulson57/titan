@@ -190,7 +190,6 @@ test.describe('SPEC-007 — the editor is operable from the keyboard alone', () 
       await expect(page.getByTestId('editor-body').locator(tag)).toHaveCount(1, {
         timeout: 5_000,
       });
-
       await expectNoPointerEvents(page);
 
       // And it survives the round trip to the database, which is what makes it
@@ -252,7 +251,23 @@ test.describe('SPEC-007 — the editor is operable from the keyboard alone', () 
     });
     await page.keyboard.press('Enter');
 
-    await expect(page.getByRole('alert')).toContainText(/http\(s\)/i);
+    // Scoped to the error's own id rather than asserted through a bare
+    // `getByRole('alert')`. Next injects its own `role="alert"` live region
+    // into every page — `#__next-route-announcer__`, which is how a client-side
+    // navigation gets announced — so the role alone resolves to two elements
+    // and dies of a strict-mode violation that says nothing about the editor.
+    //
+    // Going through the id is the stronger assertion in any case: it is the
+    // same id the input names in `aria-describedby`, so this checks that the
+    // element a screen reader is actually pointed at is the one carrying the
+    // reason, rather than that some alert somewhere on the page says it.
+    const linkError = page.locator('#editor-link-error');
+    await expect(linkError).toHaveAttribute('role', 'alert');
+    await expect(linkError).toContainText(/http\(s\)/i);
+    await expect(page.getByTestId('toolbar-link-input')).toHaveAttribute(
+      'aria-describedby',
+      'editor-link-error',
+    );
     await expect(page.getByTestId('editor-body').locator('a')).toHaveCount(0);
 
     await page.keyboard.press('ControlOrMeta+s');
@@ -308,13 +323,18 @@ test.describe('SPEC-007 — the editor is operable from the keyboard alone', () 
     // `[contenteditable="true"]`.first() and would otherwise measure the title
     // instead of ProseMirror, and a native label is what makes these findable
     // by an assistive technology at all.
-    await expect(page.getByLabel('Title')).toBeVisible();
-    await expect(page.getByLabel('Subtitle')).toBeVisible();
-    await expect(page.getByLabel('Tags')).toBeVisible();
+    //
+    // `exact: true` is required, not tidiness: `getByLabel` substring-matches
+    // by default, so "Title" also matches "Subtitle" and the locator resolves
+    // to two elements. The strict-mode violation that produces is a confusing
+    // way to be told the labels are working.
+    await expect(page.getByLabel('Title', { exact: true })).toBeVisible();
+    await expect(page.getByLabel('Subtitle', { exact: true })).toBeVisible();
+    await expect(page.getByLabel('Tags', { exact: true })).toBeVisible();
 
     await expect(page.locator('[contenteditable="true"]')).toHaveCount(1);
 
-    await page.getByLabel('Tags').focus();
+    await page.getByLabel('Tags', { exact: true }).focus();
     await page.keyboard.type('design');
     await page.keyboard.press('Enter');
     await expect(page.getByTestId('tag-list').getByRole('listitem')).toHaveCount(1);

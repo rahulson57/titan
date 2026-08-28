@@ -144,9 +144,9 @@ describe('SPEC-007 — validatePublish, at the boundaries', () => {
   it('agrees with the ceiling the repository actually enforces', () => {
     // `MAX_TAGS` is a literal in `lib/content/autosave.ts` rather than a
     // re-export of `MAX_TAGS_PER_ARTICLE`, because that module is imported by a
-    // CLIENT component and `lib/db/tags.ts` imports `@prisma/client` — the
-    // re-export would drag the repository layer, and `node:crypto` under it,
-    // into the browser bundle.
+    // CLIENT component and `lib/db/tags.ts` imports the generated Prisma
+    // client — the re-export would drag the repository layer, and
+    // `node:crypto` under it, into the browser bundle.
     //
     // A duplicated constant is a real hazard, so it is held together here
     // rather than by inspection: a test file is bundled by nobody, so it can

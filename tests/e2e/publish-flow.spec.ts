@@ -121,8 +121,11 @@ const GOOD_BODY =
   'A paragraph with enough words in it to clear the fifty-character floor the publish guard sets.';
 
 async function addTag(page: Page, name: string) {
-  await page.getByLabel('Tags').fill(name);
-  await page.getByLabel('Tags').press('Enter');
+  // `exact: true` throughout: `getByLabel` substring-matches by default, and
+  // this page also has a "Subtitle" field, so a loose "Title" would resolve to
+  // two elements.
+  await page.getByLabel('Tags', { exact: true }).fill(name);
+  await page.getByLabel('Tags', { exact: true }).press('Enter');
 }
 
 test.describe('SPEC-007 — publishing', () => {
@@ -213,7 +216,7 @@ test.describe('SPEC-007 — publishing', () => {
     // Disabled rather than accepted-and-rejected: the ceiling is SPEC-004's and
     // the repository enforces it, but an author should not be able to type a
     // sixth tag and only find out when they press Publish.
-    await expect(page.getByLabel('Tags')).toBeDisabled();
+    await expect(page.getByLabel('Tags', { exact: true })).toBeDisabled();
   });
 
   test('an edit and a republish leave slug and publishedAt byte-identical', async ({ page }) => {

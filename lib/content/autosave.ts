@@ -286,9 +286,9 @@ export const MIN_BODY_TEXT_CHARS = 50;
  * `MAX_TAGS` is a literal rather than a re-export of `MAX_TAGS_PER_ARTICLE`
  * from `lib/db/tags.ts`, and that is forced rather than chosen: this module is
  * imported by `components/editor/TagInput.tsx`, a client component, and
- * `lib/db/tags.ts` imports `@prisma/client`. Re-exporting the constant would
- * drag the whole repository layer — and `node:crypto` under it — into the
- * browser bundle.
+ * `lib/db/tags.ts` imports the generated Prisma client. Re-exporting the
+ * constant would drag the whole repository layer — and `node:crypto` under it —
+ * into the browser bundle.
  *
  * A duplicated number is a real risk, so it is not left to inspection: the
  * publish-guard suite asserts `MAX_TAGS === MAX_TAGS_PER_ARTICLE` directly. A
