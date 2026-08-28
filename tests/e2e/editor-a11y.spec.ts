@@ -196,8 +196,15 @@ test.describe('SPEC-007 — the editor is operable from the keyboard alone', () 
       // a formatting command rather than a local decoration.
       await page.keyboard.press('ControlOrMeta+s');
       await expect(page.getByTestId('save-indicator')).toHaveText('Saved', { timeout: 10_000 });
-      const stored = await getArticleById(articleId);
-      expect(stored?.bodyHtml).toContain(`<${tag}`);
+      // Polled rather than read once. `toHaveText('Saved')` above can match the
+      // state the page ARRIVED in — a draft opened from a saved row reads
+      // `Saved`, and React has not necessarily committed the `Unsaved changes`
+      // render by the time the assertion first polls — so a single read can
+      // race the save it is meant to be checking. Polling the row waits for
+      // the write itself, which is what this assertion is actually about.
+      await expect
+        .poll(async () => (await getArticleById(articleId))?.bodyHtml ?? '', { timeout: 10_000 })
+        .toContain(`<${tag}`);
     });
   }
 
@@ -231,10 +238,14 @@ test.describe('SPEC-007 — the editor is operable from the keyboard alone', () 
     await page.keyboard.press('ControlOrMeta+s');
     await expect(page.getByTestId('save-indicator')).toHaveText('Saved', { timeout: 10_000 });
 
-    const stored = await getArticleById(articleId);
-    expect(stored?.bodyHtml).toContain('href="https://example.com/essay"');
+    // Polled, not read once — see the note in the toolbar-command loop above.
+    await expect
+      .poll(async () => (await getArticleById(articleId))?.bodyHtml ?? '', { timeout: 10_000 })
+      .toContain('href="https://example.com/essay"');
     // The rendered link is hardened regardless of what the author typed.
-    expect(stored?.bodyHtml).toContain('rel="nofollow noopener noreferrer"');
+    expect((await getArticleById(articleId))?.bodyHtml).toContain(
+      'rel="nofollow noopener noreferrer"',
+    );
   });
 
   test('a javascript: link is refused at the toolbar, with a reason', async ({ page }) => {
@@ -312,7 +323,10 @@ test.describe('SPEC-007 — the editor is operable from the keyboard alone', () 
 
     await page.keyboard.press('ControlOrMeta+s');
     await expect(page.getByTestId('save-indicator')).toHaveText('Saved', { timeout: 10_000 });
-    expect((await getArticleById(articleId))?.bodyHtml).toContain('<hr />');
+    // Polled, not read once — see the note in the toolbar-command loop above.
+    await expect
+      .poll(async () => (await getArticleById(articleId))?.bodyHtml ?? '', { timeout: 10_000 })
+      .toContain('<hr />');
   });
 
   test('title, subtitle and tags are all reachable and labelled', async ({ page }) => {

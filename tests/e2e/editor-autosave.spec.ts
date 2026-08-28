@@ -225,8 +225,12 @@ test.describe('SPEC-007 — autosave', () => {
     await page.keyboard.press('ControlOrMeta+s');
 
     await expect(page.getByTestId('save-indicator')).toHaveText('Saved', { timeout: 10_000 });
-    const stored = await getArticleById(articleId);
-    expect(stored?.bodyText).toContain('saved by hand');
+    // Polled, not read once: the indicator can still be showing the state the
+    // page arrived in when the assertion first runs, so a single read races the
+    // save. Same fix as the conflict-banner test below, same reason.
+    await expect
+      .poll(async () => (await getArticleById(articleId))?.bodyText ?? '', { timeout: 10_000 })
+      .toContain('saved by hand');
 
     // And the armed debounce was cancelled, not merely pre-empted: without the
     // cancel the same document is written again two seconds later.
@@ -244,6 +248,25 @@ test.describe('SPEC-007 — autosave', () => {
     const body = page.getByTestId('editor-body');
     await body.click();
     await body.pressSequentially('local edit', { delay: 20 });
+
+    // Wait for the edit to reach the DATABASE, not merely for the indicator to
+    // read `Saved`.
+    //
+    // This is a race fix, and the race is real rather than theoretical — it
+    // failed a gate run here. A draft opened from a saved row shows `Saved` on
+    // load, because that is its honest state, so `toHaveText('Saved')` can
+    // match the state the page ARRIVED in and return before the first autosave
+    // has run at all. The rest of the test then simulates the other tab while
+    // this page still has a save in flight, and the two writes race: whichever
+    // lands second wins, and the assertion below compares against the loser.
+    //
+    // Polling the row removes the ambiguity entirely — it waits for the exact
+    // precondition the test needs (this page's edit is persisted and its
+    // version is current) rather than for a label that is also true one moment
+    // too early.
+    await expect
+      .poll(async () => (await getArticleById(articleId))?.bodyText ?? '', { timeout: 10_000 })
+      .toContain('local edit');
     await expect(page.getByTestId('save-indicator')).toHaveText('Saved', { timeout: 10_000 });
 
     // Simulate the other tab: move the row on directly, so this page's
