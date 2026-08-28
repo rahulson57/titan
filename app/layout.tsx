@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import { Inter, Source_Serif_4 } from 'next/font/google';
 
 import './globals.css';
+import { TopNav } from '../components/nav/TopNav';
 import { THEME_INIT_SCRIPT } from '../lib/theme';
 
 /**
@@ -11,11 +12,30 @@ import { THEME_INIT_SCRIPT } from '../lib/theme';
  * This replaces TASK-001's placeholder wholesale, per DEC-007. Nothing from it
  * is preserved except `lang="en"`, which is load-bearing for the a11y gate.
  *
- * Deliberately NOT here: navigation, wordmark, user menu, and the mounted
- * ThemeToggle. SPEC-011 owns the app shell and places the toggle in the top
- * nav; putting chrome in the layout would be building another slice's work.
  * This file provides the fonts, the tokens, and the pre-paint theme class —
  * the substrate every surface composes on top of.
+ *
+ * ── The app shell mounts here (SPEC-011, DEC-029) ─────────────────────────
+ * TASK-002 wrote, correctly for its moment: *"Deliberately NOT here:
+ * navigation, wordmark, user menu, and the mounted ThemeToggle. SPEC-011 owns
+ * the app shell and places the toggle in the top nav; putting chrome in the
+ * layout would be building another slice's work."* That slice has now landed,
+ * and this is the seat it was holding open.
+ *
+ * SPEC-011's deliverable is "the persistent chrome around **every page**", and
+ * the root layout is the only place in an App Router tree that is genuinely
+ * every page. Its "Files owned" list omitted this file — an omission in a
+ * derived list rather than an intent, adjudicated as such in DEC-029, which
+ * widened TASK-008's scope by this file alone.
+ *
+ * Everything TASK-002 put here is untouched: the two font families and their
+ * CSS variables, `metadata`, `viewport`, `lang="en"` (load-bearing for the
+ * a11y gate), and `THEME_INIT_SCRIPT` in its original position in `<head>`.
+ * The only change is `<TopNav />` above `{children}`.
+ *
+ * `RootLayout` stays SYNCHRONOUS. `TopNav` is the async component — it is the
+ * one that reads the session — so the dynamic dependency is confined to the
+ * subtree that needs it and the pre-paint script path is unchanged.
  */
 
 /**
@@ -96,7 +116,13 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         */}
         <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
       </head>
-      <body>{children}</body>
+      <body>
+        {/* SPEC-011's persistent chrome. Above `{children}` so it is the first
+            landmark in the document, which is where a screen-reader user and a
+            keyboard user both expect the navigation to be. */}
+        <TopNav />
+        {children}
+      </body>
     </html>
   );
 }
