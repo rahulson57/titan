@@ -1,11 +1,11 @@
 /**
- * Playwright global setup — runs `npm run setup` BEFORE the web server boots.
+ * Playwright global setup — runs `npm run setup` once, before any test runs.
  *
  * ── Why this file exists ───────────────────────────────────────────────────
  * SPEC-001's boot contract is a *sequence*: clean clone → `npm run setup` →
  * `npm run dev` → HTTP 200. `boot.spec.ts` used to execute the setup step from
- * inside a test, which meant it ran with `next dev` already listening — the
- * reverse of the order the contract describes, and a race.
+ * inside a test, which meant it ran not merely with `next dev` listening, but
+ * after other specs had already driven the app through it. That is a race.
  *
  * The race is not theoretical. `npm run setup` runs `prisma migrate deploy`,
  * and the migration engine needs a write lock on the SQLite file. Measured on
@@ -29,11 +29,31 @@
  * would each have hit it in turn, and Playwright orders files alphabetically,
  * so `article`, `bookmarks` and `editor` all sort ahead of `boot` too.
  *
- * Running setup here removes the race by construction: `globalSetup` completes
- * before Playwright starts `webServer`, so nothing is connected to the database
- * when the migration runs. Authorised by the operator (MSG-2261), which also
- * widened TASK-004's file scope to cover this file, `playwright.config.ts` and
- * `boot.spec.ts`.
+ * Running setup here fixes it — but NOT for the reason the ordering suggests,
+ * and the difference is the whole point of this paragraph (DEC-023, verified
+ * against the installed runner source rather than the docs). In Playwright
+ * 1.55.1 `globalSetup` runs AFTER `webServer`, not before: `webServer` is
+ * registered as a plugin, and `createGlobalSetupTasks` awaits every plugin's
+ * `setup()` — which is what boots `next dev` and polls its URL — before it
+ * invokes any `globalSetup` module. By the time this file runs, the dev server
+ * is already up and already holding its Prisma connection.
+ *
+ * THE INVARIANT THAT ACTUALLY HOLDS IS: setup runs before the app's first
+ * WRITE. Not before the app starts. Per the table above, a connection that has
+ * only READ does not block the migration; only one that has WRITTEN does. At
+ * this moment the server has connected and served its readiness probe, but no
+ * test has run, so nothing has written, and `migrate deploy` gets its lock.
+ *
+ * That margin is narrower than "setup goes first" implies, and it is worth
+ * knowing what would close it. It rests on nothing writing between `webServer`
+ * boot and the end of this function. Anything that makes a page load write —
+ * a session touch, a visit counter, a warm-up job, middleware that records a
+ * request — regresses this, and it will resurface as the same misleading
+ * "database is locked" inside some later slice's spec file rather than here.
+ * If you add write-on-boot behaviour, this file is what has to change with it.
+ *
+ * Authorised by the operator (MSG-2261), which also widened TASK-004's file
+ * scope to cover this file, `playwright.config.ts` and `boot.spec.ts`.
  *
  * ── Why it runs setup TWICE ────────────────────────────────────────────────
  * SPEC-001 requires setup to be idempotent — specifically that a second run

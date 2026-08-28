@@ -18,17 +18,20 @@
  *
  * ── `npm run setup` is executed by globalSetup, not from in here ───────────
  * These tests used to shell out to `scripts/setup.mjs` themselves. That put a
- * `prisma migrate deploy` in the middle of a Playwright run with `next dev`
- * already listening — the reverse of the sequence this very file exists to
- * assert, and a race that fails outright once the app has written anything:
- * an open Prisma connection that has WRITTEN blocks the migration engine from
- * taking its write lock, and the schema engine does not inherit the app's
- * `busy_timeout`, so it fails instantly rather than waiting.
+ * `prisma migrate deploy` in the middle of a Playwright run, after other specs
+ * had already driven the app — a race that fails outright once the app has
+ * written anything: an open Prisma connection that has WRITTEN blocks the
+ * migration engine from taking its write lock, and the schema engine does not
+ * inherit the app's `busy_timeout`, so it fails instantly rather than waiting.
  *
  * `tests/e2e/global.setup.ts` therefore runs setup — twice, since idempotency
- * is only observable across two runs — before `webServer` boots, and these
- * tests assert the OUTCOME. The criteria are unchanged; only who executes them
- * moved, and the new order is the one SPEC-001's contract actually describes.
+ * is only observable across two runs — before any TEST runs, and these tests
+ * assert the OUTCOME. The criteria are unchanged; only who executes them moved.
+ * Note the invariant precisely (DEC-023): `globalSetup` runs AFTER `webServer`
+ * boots, not before it. What makes the move safe is that no test has written
+ * yet at that point — "setup before the app's first WRITE", not "setup before
+ * the server starts". The reasoning, and what would break it, is in
+ * `tests/e2e/global.setup.ts`.
  *
  * Authorised by the operator in MSG-2261 as part of TASK-004, which is where
  * the latent defect surfaced: SPEC-005's sign-up was the first e2e write in
@@ -56,7 +59,7 @@ test.describe('SPEC-001 — boot contract preconditions', () => {
   });
 
   test('`npm run setup` succeeds on a tree with no ./data/ and no .env.local', () => {
-    // Executed for real by globalSetup, before the server existed. Running it
+    // Executed for real by globalSetup, before any test had run. Running it
     // for real is still the point: it is the only way to know setup does not
     // depend on state a previous run left behind.
     //
@@ -66,7 +69,7 @@ test.describe('SPEC-001 — boot contract preconditions', () => {
     // SQLite error had to be recovered by instrumenting the harness by hand.
     expect(
       process.env[BOOT_SETUP.ok],
-      `npm run setup failed before the server started:\n${process.env[BOOT_SETUP.error] ?? '(no output captured)'}`,
+      `npm run setup failed in globalSetup:\n${process.env[BOOT_SETUP.error] ?? '(no output captured)'}`,
     ).toBe('1');
 
     expect(existsSync(join(REPO_ROOT, 'data')), 'setup must create ./data/').toBe(true);
