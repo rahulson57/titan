@@ -1,5 +1,6 @@
 /**
- * Playwright global setup — runs `npm run setup` once, before any test runs.
+ * Playwright boot setup — runs `npm run setup` once per run, before the web
+ * server starts and therefore before any test runs.
  *
  * ── Why this file exists ───────────────────────────────────────────────────
  * SPEC-001's boot contract is a *sequence*: clean clone → `npm run setup` →
@@ -29,31 +30,56 @@
  * would each have hit it in turn, and Playwright orders files alphabetically,
  * so `article`, `bookmarks` and `editor` all sort ahead of `boot` too.
  *
- * Running setup here fixes it — but NOT for the reason the ordering suggests,
- * and the difference is the whole point of this paragraph (DEC-023, verified
- * against the installed runner source rather than the docs). In Playwright
- * 1.55.1 `globalSetup` runs AFTER `webServer`, not before: `webServer` is
- * registered as a plugin, and `createGlobalSetupTasks` awaits every plugin's
- * `setup()` — which is what boots `next dev` and polls its URL — before it
- * invokes any `globalSetup` module. By the time this file runs, the dev server
- * is already up and already holding its Prisma connection.
+ * ── WHERE IT RUNS FROM, AND WHY THAT MOVED (DEC-040) ───────────────────────
+ * This used to be wired only as Playwright's `globalSetup`. That was ordered
+ * *later* than it looks: DEC-023 established, against the installed runner
+ * source rather than the docs, that in Playwright 1.55.1 `globalSetup` runs
+ * AFTER `webServer` — `webServer` is registered as a plugin, and
+ * `createGlobalSetupTasks` awaits every plugin's `setup()` (which is what
+ * boots the dev server and polls its URL) before invoking any `globalSetup`
+ * module.
  *
- * THE INVARIANT THAT ACTUALLY HOLDS IS: setup runs before the app's first
- * WRITE. Not before the app starts. Per the table above, a connection that has
- * only READ does not block the migration; only one that has WRITTEN does. At
- * this moment the server has connected and served its readiness probe, but no
- * test has run, so nothing has written, and `migrate deploy` gets its lock.
+ * For the DATABASE that was still safe, and the reasoning was right as far as
+ * it went: the invariant needed is "setup runs before the app's first WRITE",
+ * not "before the app starts", and at `globalSetup` time the server has served
+ * only its readiness probe. What that reasoning did not cover is that step 4
+ * of `scripts/setup.mjs` is `prisma generate`, which rewrites
+ * `libquery_engine-darwin-arm64.dylib.node` — 16.8 MB of native code the dev
+ * server has already memory-mapped. Replacing a binary under a live mmap is
+ * not a database race and no amount of read/write reasoning about SQLite
+ * catches it. It surfaces as `SQLITE_CANTOPEN` against a completely healthy
+ * database, which is why it read for weeks as flakiness in whichever slice
+ * happened to be running.
  *
- * That margin is narrower than "setup goes first" implies, and it is worth
- * knowing what would close it. It rests on nothing writing between `webServer`
- * boot and the end of this function. Anything that makes a page load write —
- * a session touch, a visit counter, a warm-up job, middleware that records a
- * request — regresses this, and it will resurface as the same misleading
- * "database is locked" inside some later slice's spec file rather than here.
- * If you add write-on-boot behaviour, this file is what has to change with it.
+ * It stayed invisible while `generate` was a no-op (when the generated
+ * client's `sourceFilePath` already matches the invoking checkout, it rewrites
+ * nothing). Anything that repoints the shared client at another worktree turns
+ * that no-op into a real 16.8 MB rewrite on every subsequent run, and the gate
+ * starts destroying its own query engine mid-flight.
  *
- * Authorised by the operator (MSG-2261), which also widened TASK-004's file
- * scope to cover this file, `playwright.config.ts` and `boot.spec.ts`.
+ * So `runBootSetup()` is now called from `playwright.config.ts` at module
+ * load. That is strictly before the web server, and not by convention:
+ * Playwright has to read the config to discover there is a `webServer` at all.
+ * The `globalSetup` hook below stays wired and calls the same function, which
+ * no-ops if it has already run — a fallback, not a second execution.
+ *
+ * The env-var channel is why this is a function called from the config rather
+ * than a command chained onto `webServer.command`. Both orderings would be
+ * correct; only this one runs in the runner process, and `boot.spec.ts` reads
+ * its verdicts out of `process.env` (see below). A chained shell command is a
+ * child and can publish nothing back to its parent.
+ *
+ * WHAT WOULD BREAK THIS AGAIN: the database invariant is unchanged and still
+ * narrower than "setup goes first" implies — it rests on nothing writing
+ * between setup and the end of the run's first write. Anything that makes a
+ * page load write (a session touch, a visit counter, a warm-up job,
+ * middleware that records a request) is fine now that setup precedes the boot,
+ * but moving this call back into `globalSetup` reinstates both hazards at
+ * once. If you need to move it, move it EARLIER, never later.
+ *
+ * Authorised by the operator (MSG-2261, which widened TASK-004's file scope to
+ * cover this file and `playwright.config.ts`; TASK-017 for the DEC-040
+ * ordering repair).
  *
  * ── Why it runs setup TWICE ────────────────────────────────────────────────
  * SPEC-001 requires setup to be idempotent — specifically that a second run
@@ -63,10 +89,11 @@
  * handed to `boot.spec.ts`, which still owns the assertion.
  *
  * ── How the result reaches the tests ───────────────────────────────────────
- * Through `process.env`. Playwright runs this in the main process and spawns
- * workers from it, so anything set here is inherited — the documented channel
- * for passing global-setup results to specs, and the reason no temp file is
- * involved (a file under `outputDir` would be swept between runs).
+ * Through `process.env`. This runs in Playwright's main process and the
+ * workers are spawned from it, so anything set here is inherited — the
+ * documented channel for passing setup results to specs, and the reason no
+ * temp file is involved (a file under `outputDir` would be swept between
+ * runs).
  *
  * The failure text is carried across deliberately. The old arrangement used
  * `stdio: 'pipe'` and asserted on the exit code, so a failing gate reported
@@ -134,7 +161,27 @@ function envLocal(): string {
   return existsSync(ENV_LOCAL) ? readFileSync(ENV_LOCAL, 'utf8') : '';
 }
 
-export default function globalSetup(): void {
+/**
+ * Run setup twice and publish the verdicts, at most once per process tree.
+ *
+ * Called from `playwright.config.ts` at module load — see the DEC-040 section
+ * above for why that, and not `globalSetup`, is where the ordering is safe.
+ *
+ * Idempotent on two levels, because this module is loaded more than once:
+ *
+ *  - `hasRun` covers a second call within one process (config load, then the
+ *    `globalSetup` hook).
+ *  - the published env var covers Playwright's WORKER processes, which load
+ *    the config again but inherit the runner's environment. Without it, every
+ *    worker would re-run migrate/seed — after the server booted, which is
+ *    precisely the ordering this change exists to remove.
+ */
+let hasRun = false;
+
+export function runBootSetup(): void {
+  if (hasRun || process.env[BOOT_SETUP.ok] !== undefined) return;
+  hasRun = true;
+
   const first = runSetup();
 
   // Only meaningful if the first run worked; a second attempt after a failure
@@ -150,4 +197,16 @@ export default function globalSetup(): void {
   // seeing, not just a rotated AUTH_SECRET.
   process.env[BOOT_SETUP.idempotent] =
     afterFirst.length > 0 && afterFirst === afterSecond ? '1' : '0';
+}
+
+/**
+ * Playwright's `globalSetup` hook — a fallback, not the primary path.
+ *
+ * On a normal run `playwright.config.ts` has already called `runBootSetup()`
+ * at module load and this no-ops. It stays wired so that any path which
+ * reaches the runner without loading that module still gets a setup, and so
+ * the hook remains where a reader looks for it.
+ */
+export default function globalSetup(): void {
+  runBootSetup();
 }
