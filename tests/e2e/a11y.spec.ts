@@ -35,12 +35,16 @@ const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
  * route to resolve; `owner` names the task that brings it, so a skipped audit
  * reads as a dependency rather than an omission.
  *
- * `expectTestId` is optional and asserts the audit actually landed on the
- * surface it claims to be auditing. See `auditedTheRightPage` below for why a
- * missing one is a real hazard rather than a nicety.
+ * `expectTestId` asserts the audit actually landed on the surface it claims to
+ * be auditing. See `auditedTheRightPage` below for why a missing one is a real
+ * hazard rather than a nicety.
+ *
+ * `requiresAuth` says the route is behind the session check, so the audit signs
+ * in before navigating. Without it the middleware redirect turns the audit into
+ * a clean pass for the sign-in page — see the editor row.
  */
 const SURFACES = [
-  { name: 'home feed', path: '/', source: 'app/page.tsx', owner: 'TASK-007 (Feed & Search)' },
+  { name: 'home feed', path: '/', source: 'app/page.tsx', owner: 'TASK-007 (Feed & Search)', expectTestId: 'home-feed' },
   // `path` is a fallback; `resolve` is what actually runs. The literal it
   // replaced was `/article/hello-world`, and no such slug can exist: SPEC-004
   // mints slugs as `kebab(title)-<6 chars of the article id>`. So this surface
@@ -66,8 +70,35 @@ const SURFACES = [
     },
     source: 'app/article/[slug]/page.tsx',
     owner: 'TASK-009 (Reading & Engagement)',
+    expectTestId: 'article-page',
   },
-  { name: 'editor', path: '/editor/new', source: 'app/editor/new/page.tsx', owner: 'TASK-006 (Editor & Content)' },
+  // TASK-020 / the fifth instance of this file's false-pass class. This row
+  // audited the SIGN-IN PAGE and reported the editor clean, every run, since
+  // TASK-006 landed:
+  //
+  //  - `/editor` is a protected prefix (`lib/auth/config.ts:96`), so
+  //    `middleware.ts` redirects an anonymous request to `/signin?next=...`.
+  //    Playwright follows redirects, so the final response is a 200 and
+  //    nothing in the audit noticed the address had changed.
+  //  - `applyTheme`'s dark-class assertion passed too, because the sign-in
+  //    page carries the same theme system every page does. Both halves of the
+  //    check were satisfied by a page that is not this surface.
+  //  - `app/editor/new/page.tsx` exists, so the `existsSync` guard never
+  //    skipped the row. It ran, and it was green, for coverage it never had.
+  //
+  // So sealed criterion 14 — "0 serious and 0 critical on /editor in BOTH
+  // themes" — had never once been evaluated against the editor. `requiresAuth`
+  // is the fix for the redirect and `expectTestId` is what stops the class
+  // recurring: `editor-surface` exists only on `components/editor/Editor.tsx`,
+  // so an audit that lands anywhere else now FAILS instead of passing quietly.
+  {
+    name: 'editor',
+    path: '/editor/new',
+    source: 'app/editor/new/page.tsx',
+    owner: 'TASK-006 (Editor & Content)',
+    requiresAuth: true,
+    expectTestId: 'editor-surface',
+  },
   // TASK-010 / DEC-049. Two corrections, and both were live defects:
   //
   //  - `source` was `app/@[handle]/page.tsx`, a path that can never exist:
@@ -83,8 +114,8 @@ const SURFACES = [
   // `expectTestId` is what makes the second class impossible here rather than
   // merely fixed once.
   { name: 'profile', path: '/@demo', source: 'app/[handle]/page.tsx', owner: 'TASK-010 (Profiles)', expectTestId: 'profile-page' },
-  { name: 'tag', path: '/tag/design', source: 'app/tag/[slug]/page.tsx', owner: 'TASK-007 (Feed & Search)' },
-  { name: 'search', path: '/search?q=design', source: 'app/search/page.tsx', owner: 'TASK-007 (Feed & Search)' },
+  { name: 'tag', path: '/tag/design', source: 'app/tag/[slug]/page.tsx', owner: 'TASK-007 (Feed & Search)', expectTestId: 'tag-page' },
+  { name: 'search', path: '/search?q=design', source: 'app/search/page.tsx', owner: 'TASK-007 (Feed & Search)', expectTestId: 'search-page' },
 ] as const;
 
 const THEMES = ['light', 'dark'] as const;
@@ -99,6 +130,57 @@ const THEMES = ['light', 'dark'] as const;
  * skip, so the dark half waits explicitly.
  */
 const hasThemeSystem = () => existsSync(join(REPO_ROOT, 'lib', 'theme.ts'));
+
+/**
+ * The password every seeded user shares (SPEC-005, `prisma/seed.ts:72`).
+ *
+ * The same constant, for the same reason, as `tests/e2e/draft-privacy.spec.ts`
+ * — the seed gives all 50 corpus users one hash, so signing in as any of them
+ * needs no fixture of its own.
+ */
+const SEEDED_PASSWORD = 'titan1234';
+
+/**
+ * Who to sign in as, resolved from the corpus rather than written as a literal.
+ *
+ * `prisma/seed.ts:71` fixes `DEMO_HANDLE = 'demo'`; every other user is
+ * `${first}_${index}` and moves with the generator. That is the same single
+ * fixed point the profile row's `/@demo` rests on, so this reads it back out of
+ * the database instead of assuming the address of it: an empty corpus skips
+ * with a reason, and a corpus that renamed the account fails at
+ * `waitForURL('/')` rather than auditing the sign-in page it was left on.
+ */
+async function seededSignInEmail(): Promise<string | null> {
+  const user = await getDb().user.findFirst({
+    where: { handle: 'demo' },
+    select: { email: true },
+  });
+  return user?.email ?? null;
+}
+
+/**
+ * Sign in through the real form, so the audit reaches routes behind the session
+ * check as an authenticated reader does.
+ *
+ * This is the sign-in path the rest of the e2e suite already uses (see
+ * `draft-privacy.spec.ts` and `bookmarks-page.spec.ts`): the actual `/signin`
+ * form, submitted, ending on `/`. Setting a `titan.session` cookie directly
+ * would be shorter and would get past `middleware.ts`, but `/editor/new` calls
+ * `requireAuth()`, which resolves the cookie against SQLite — a hand-written
+ * one lands back on sign-in, which is the exact false pass this task exists to
+ * remove.
+ *
+ * `waitForURL('/')` is load-bearing: if the credentials stop working, this
+ * throws here with "sign-in did not land on /" instead of leaving the run on
+ * the sign-in page for axe to audit and call clean.
+ */
+async function signIn(page: Page, email: string): Promise<void> {
+  await page.goto('/signin');
+  await page.getByLabel('Email').fill(email);
+  await page.getByLabel('Password').fill(SEEDED_PASSWORD);
+  await page.getByRole('button', { name: /^sign in$/i }).click();
+  await page.waitForURL('/');
+}
 
 /**
  * Put the page in a known theme before auditing.
@@ -129,16 +211,18 @@ async function applyTheme(page: Page, theme: (typeof THEMES)[number], path: stri
  * the most comfortable kind of false pass, because nothing about it looks
  * wrong in a report.
  *
- * This is not hypothetical here. The profile surface probed `/@ada` against a
- * corpus whose only fixed handle is `demo`, and would have audited the
- * not-found page; the article surface probes `/article/hello-world`, a slug
- * that cannot exist under SPEC-004's `kebab(title)-<6 chars>` scheme.
+ * This is not hypothetical here, and it was not rare. Three of the six rows
+ * were auditing a page they never named: the profile surface probed `/@ada`
+ * against a corpus whose only fixed handle is `demo`; the article surface
+ * probed `/article/hello-world`, a slug that cannot exist under SPEC-004's
+ * `kebab(title)-<6 chars>` scheme; the editor surface probed a protected route
+ * anonymously and audited the sign-in page it was redirected to. Every one of
+ * them reported 0 serious and 0 critical.
  *
- * `expectTestId` is opt-in per surface rather than required for all six,
- * because the other rows are owned by other slices and adding an assertion to
- * a passing audit that this task does not own would be a scope violation
- * dressed up as diligence. The two remaining gaps are raised with the
- * coordinator rather than patched here — see the note in this task's proposal.
+ * `expectTestId` was opt-in per surface when it landed (TASK-010), because the
+ * other rows belonged to other slices. TASK-020 fills in the remaining five:
+ * all six surfaces now assert where they landed, and the coverage test at the
+ * foot of this file fails if any row loses its assertion.
  */
 async function auditedTheRightPage(
   page: Page,
@@ -189,6 +273,21 @@ test.describe('SPEC-002 — zero serious or critical axe violations', () => {
           path === null,
           `the seed corpus holds no row to build ${surface.name} from`,
         );
+
+        // Behind the session check: sign in FIRST, so the navigation below is
+        // not turned into a sign-in page by `middleware.ts` (TASK-020). The
+        // order matters and is the only order that works — `applyTheme`
+        // registers the theme init script and then navigates in one step, so
+        // authenticating after it would audit the redirect target instead.
+        if ('requiresAuth' in surface && surface.requiresAuth) {
+          const email = await seededSignInEmail();
+          test.skip(
+            email === null,
+            `the seed corpus holds no account to sign in as, so ${surface.name} ` +
+              'cannot be reached as its author',
+          );
+          await signIn(page, email as string);
+        }
 
         await applyTheme(page, theme, path as string);
         await auditedTheRightPage(page, surface);
@@ -248,5 +347,24 @@ test.describe('SPEC-002 — the a11y gate covers the whole v1 surface list', () 
     ]);
     expect(THEMES).toEqual(['light', 'dark']);
     expect(SURFACES.length * THEMES.length).toBe(12);
+
+    // Every surface asserts WHERE it landed (TASK-020). Dropping an
+    // `expectTestId` would not fail any audit — it would make one stop being
+    // able to fail, which is how three of these rows spent weeks green while
+    // auditing the 404 page, the not-found page and the sign-in page. This is
+    // the only assertion that notices.
+    // Widened deliberately: `as const` makes every row's shape exact, so
+    // `filter` on a property they all now carry narrows to `never` and the
+    // assertion stops type-checking the moment it is true. Reading them through
+    // the optional shape keeps the check honest if a row loses the property.
+    const rows: readonly { name: string; expectTestId?: string; requiresAuth?: boolean }[] =
+      SURFACES;
+    expect(rows.filter((s) => !s.expectTestId).map((s) => s.name)).toEqual([]);
+
+    // The editor is the one v1 surface behind the session check
+    // (`lib/auth/config.ts` lists `/editor` in PROTECTED_PREFIXES). If this
+    // list ever shrinks, an audit is being run anonymously against a route
+    // that redirects, and the row is auditing the sign-in page again.
+    expect(rows.filter((s) => s.requiresAuth).map((s) => s.name)).toEqual(['editor']);
   });
 });
