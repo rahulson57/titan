@@ -90,6 +90,81 @@ function recordActionCalls(page: Page): { calls: Array<{ at: number }>; startedA
   return { calls, startedAt };
 }
 
+/**
+ * The `datetime` of the timestamp beside the save indicator, or `null` when
+ * there is none. Read in one `evaluate` rather than through a locator so a
+ * missing element answers immediately instead of auto-waiting.
+ */
+async function savedStamp(page: Page): Promise<string | null> {
+  return page.evaluate(
+    () => document.querySelector('[data-testid="saved-at"]')?.getAttribute('datetime') ?? null,
+  );
+}
+
+/**
+ * Wait until THIS PAGE has completed a save of its own, and return its stamp.
+ *
+ * `expect(indicator).toHaveText('Saved')` cannot carry that, and the difference
+ * is the single flakiest thing this suite has had in it. A draft opened from a
+ * stored row reads `Saved` on arrival because that is its honest state, and
+ * React has not necessarily committed the `Unsaved changes` render by the time
+ * the assertion first polls — so the assertion can match the state the page
+ * ARRIVED in and return while the first autosave is still in flight. Anything
+ * sequenced after it then races that save.
+ *
+ * The timestamp is the signal that tells the two apart. `SaveIndicator` renders
+ * it only when the state is `clean` AND `savedAt` is set, and `savedAt` is set
+ * from the RESULT of a successful save — so it does not exist until this page
+ * has completed one. A request still in flight leaves the state `saving`, a 409
+ * or a transport error leaves it `error`, and neither renders the element.
+ * Passing `previous` waits for a stamp DIFFERENT from that one, which is how a
+ * second save is distinguished from the first.
+ *
+ * Waiting on the browser also takes a second process out of the precondition.
+ * Reading the row from the test process while the dev server is writing it is
+ * the one part of this suite that has failed in the acceptance gate without
+ * ever reproducing locally, and a precondition is the worst place for it: the
+ * assertion that follows is then measuring the race rather than the behaviour.
+ * The row is still read where the row is what the criterion is ABOUT — just
+ * after this has established that there is something committed to read.
+ */
+async function expectSaveLanded(page: Page, previous: string | null = null): Promise<string> {
+  await expect
+    .poll(
+      async () =>
+        page.evaluate((prev) => {
+          const stamp = document
+            .querySelector('[data-testid="saved-at"]')
+            ?.getAttribute('datetime');
+          if (stamp && stamp !== prev) return 'saved';
+          const indicator = document.querySelector('[data-testid="save-indicator"]');
+          return `not yet — indicator="${indicator?.textContent ?? '<absent>'}", stamp=${stamp ?? '<none>'}`;
+        }, previous),
+      {
+        // 30s, matching the headroom the coordinator approved for the poll this
+        // replaced. The gate compiles every route cold and seeds the database
+        // inside the run, so the FIRST autosave is the one most likely to be
+        // waiting on something other than the 2s debounce. Measured in that
+        // configuration: `/editor/[id]` compiles in 832ms and the first POST
+        // answers in 22ms — the server action is bundled with the route, not
+        // compiled separately, so first-compile latency is nowhere near this
+        // budget. It is slack, not a budget: it costs nothing when the save
+        // lands, and when it does not the message below names the mode.
+        timeout: 30_000,
+        message:
+          'the editor never completed a save of its own. The indicator text above says which ' +
+          'failure this was: "Save failed — retry" means the request errored or the server ' +
+          'refused it, "Saving…" means it was still in flight, and "Unsaved changes" means the ' +
+          'scheduler never fired at all.',
+      },
+    )
+    .toBe('saved');
+
+  const stamp = await savedStamp(page);
+  if (stamp === null) throw new Error('the save timestamp vanished between polls');
+  return stamp;
+}
+
 test.describe('SPEC-007 — autosave', () => {
   test.skip(!appIsBootable(), 'no bootable app yet');
 
@@ -206,6 +281,12 @@ test.describe('SPEC-007 — autosave', () => {
         'never fires while the author keeps typing — the ceiling has to be able to pre-empt it.',
     ).toBeLessThan(AUTOSAVE_MAX_INTERVAL_MS);
 
+    // The ceiling save fires ~30s in, i.e. only a few seconds before this line,
+    // so wait for its result to have reached the page before reading the row it
+    // wrote. Same reason as everywhere else in this file: the row is what the
+    // criterion is about, and the wait in front of it should not be the thing
+    // under test.
+    await expectSaveLanded(page);
     const stored = await getArticleById(articleId);
     expect(stored?.bodyText).toContain('typing');
   });
@@ -224,10 +305,11 @@ test.describe('SPEC-007 — autosave', () => {
     const { calls } = recordActionCalls(page);
     await page.keyboard.press('ControlOrMeta+s');
 
-    await expect(page.getByTestId('save-indicator')).toHaveText('Saved', { timeout: 10_000 });
-    // Polled, not read once: the indicator can still be showing the state the
-    // page arrived in when the assertion first runs, so a single read races the
-    // save. Same fix as the conflict-banner test below, same reason.
+    // The row read below is the assertion — Cmd/Ctrl+S has to reach the
+    // DATABASE, not merely repaint the label — so the wait in front of it has
+    // to be a real one. `toHaveText('Saved')` is not: the page arrived reading
+    // `Saved`. See `expectSaveLanded`.
+    await expectSaveLanded(page);
     await expect
       .poll(async () => (await getArticleById(articleId))?.bodyText ?? '', { timeout: 10_000 })
       .toContain('saved by hand');
@@ -245,54 +327,34 @@ test.describe('SPEC-007 — autosave', () => {
     const articleId = await seedDraft(account.email);
 
     await page.goto(`/editor/${articleId}`, { waitUntil: 'networkidle' });
+
+    // The signal `expectSaveLanded` waits on must be ABSENT on arrival, or the
+    // wait below would pass instantly and prove nothing. This asserts that
+    // directly rather than trusting it: a later change that seeded `savedAt`
+    // from the server row — a plausible, even reasonable, thing to do — would
+    // silently turn every `expectSaveLanded` in this file back into the
+    // `toHaveText('Saved')` race it replaced. This line fails loudly instead.
+    await expect(page.getByTestId('saved-at')).toHaveCount(0);
+
     const body = page.getByTestId('editor-body');
     await body.click();
     await body.pressSequentially('local edit', { delay: 20 });
 
-    // Wait for the edit to reach the DATABASE, not merely for the indicator to
-    // read `Saved`.
+    // The other-tab write below must land AFTER this page's first autosave, or
+    // the test proves nothing: whichever of the two writes goes second wins,
+    // and the version this page holds would be current rather than stale.
     //
-    // `toHaveText('Saved')` alone cannot carry this precondition: a draft opened
-    // from a saved row reads `Saved` because that is its honest state, and React
-    // has not necessarily committed the `Unsaved changes` render by the time the
-    // assertion first polls. So it can match the state the page ARRIVED in and
-    // return while the first autosave is still in flight — after which the
-    // simulated other-tab write below races it, and whichever lands second
-    // wins. Polling the row waits for the write itself, which is the actual
-    // precondition.
-    //
-    // ── The timeout is 30s, and the message is instrumented, deliberately ────
-    // This test failed three acceptance-gate runs while passing locally in every
-    // configuration tried: warm and cold `.next`, freshly seeded and reused
-    // database, isolated and in the full suite. The gate reported the row's
-    // `bodyText` still empty, i.e. the first save had simply not landed.
-    //
-    // Because the cause is not reproducible here, this does two things rather
-    // than one. The longer budget removes "the gate box is slower than this one"
-    // as an explanation — 30s is 15x the 2s debounce and still well inside the
-    // 60s per-test timeout. And the failure message reports the indicator text
-    // and the row's version, so if it fails again the artifact says WHICH of the
-    // three possibilities happened: `Save failed — retry` (the request errored),
-    // `Saving…` (still in flight), or `Saved` with an unchanged version (a 409).
-    // The previous failure said only `Received string: ""`, which distinguishes
-    // none of them.
-    await expect
-      .poll(
-        async () => {
-          const row = await getArticleById(articleId);
-          const indicator = await page.getByTestId('save-indicator').textContent();
-          return `${row?.bodyText ?? '<no row>'} | indicator=${indicator} | version=${row?.version}`;
-        },
-        {
-          timeout: 30_000,
-          message:
-            'the first autosave never reached the database. The indicator and version above say ' +
-            'which failure this was: "Save failed — retry" means the request errored, "Saving…" ' +
-            'means it was still in flight, and "Saved" with an unchanged version means a 409.',
-        },
-      )
-      .toContain('local edit');
-    await expect(page.getByTestId('save-indicator')).toHaveText('Saved', { timeout: 10_000 });
+    // So wait for the save to have completed — from the browser, which is the
+    // only place that knows. This precondition used to be a 30s poll of the
+    // row from the test process, and it failed the acceptance gate twice while
+    // passing locally in every configuration tried (warm and cold `.next`,
+    // fresh and reused database, isolated and in the full suite), reporting the
+    // row still empty. Whatever makes a cross-process SQLite read lag the
+    // dev server's write on that box, a precondition is the wrong place to
+    // discover it: the assertions below are about the CONFLICT, and they were
+    // failing on the setup instead. `expectSaveLanded` waits for the save
+    // result the page itself received.
+    await expectSaveLanded(page);
 
     // Simulate the other tab: move the row on directly, so this page's
     // last-known version is now behind.
@@ -332,7 +394,10 @@ test.describe('SPEC-007 — autosave', () => {
     await page.getByTestId('editor-body').click();
     await page.getByTestId('editor-body').pressSequentially('First words.', { delay: 20 });
 
-    await expect(page.getByTestId('save-indicator')).toHaveText('Saved', { timeout: 10_000 });
+    // `/editor/new` arrives with no save timestamp at all — there is no row
+    // yet — so this is the cleanest place the signal exists: the element only
+    // appears once `createDraft` has come back.
+    await expectSaveLanded(page);
 
     // The URL moved to the new id WITHOUT a navigation, so a refresh lands on
     // the draft rather than on another blank document.

@@ -102,6 +102,59 @@ async function openEditor(page: Page): Promise<string> {
   return article.id;
 }
 
+/**
+ * Wait until THIS PAGE has completed a save of its own.
+ *
+ * `expect(indicator).toHaveText('Saved')` cannot carry that: the editor is
+ * opened on a stored row, so it ARRIVES reading `Saved`, and the assertion can
+ * match that state and return while the Ctrl/Cmd+S save is still in flight.
+ * Everything sequenced after it then races the save.
+ *
+ * The timestamp beside the indicator is the signal that tells the two apart.
+ * `SaveIndicator` renders it only when the state is `clean` AND `savedAt` is
+ * set, and `savedAt` comes from the RESULT of a successful save — so it does
+ * not exist until this page has completed one. A request in flight leaves the
+ * state `saving` and a refusal leaves it `error`; neither renders it.
+ *
+ * The same helper, and the same reasoning, is in
+ * `tests/e2e/editor-autosave.spec.ts`. It is duplicated rather than shared
+ * because the two suites have no other common module and a
+ * `tests/e2e/helpers/` for one six-line function would be a worse trade than
+ * two copies that each read in place. If a third suite needs it, extract it.
+ */
+async function expectSaveLanded(page: Page): Promise<void> {
+  await expect
+    .poll(
+      async () =>
+        page.evaluate(() => {
+          const stamp = document
+            .querySelector('[data-testid="saved-at"]')
+            ?.getAttribute('datetime');
+          if (stamp) return 'saved';
+          const indicator = document.querySelector('[data-testid="save-indicator"]');
+          return `not yet — indicator="${indicator?.textContent ?? '<absent>'}"`;
+        }),
+      {
+        // 30s, matching the headroom the coordinator approved for the poll this
+        // replaced. The gate compiles every route cold and seeds the database
+        // inside the run, so the FIRST autosave is the one most likely to be
+        // waiting on something other than the 2s debounce. Measured in that
+        // configuration: `/editor/[id]` compiles in 832ms and the first POST
+        // answers in 22ms — the server action is bundled with the route, not
+        // compiled separately, so first-compile latency is nowhere near this
+        // budget. It is slack, not a budget: it costs nothing when the save
+        // lands, and when it does not the message below names the mode.
+        timeout: 30_000,
+        message:
+          'the editor never completed a save of its own. The indicator text above says which ' +
+          'failure this was: "Save failed — retry" means the request errored or the server ' +
+          'refused it, "Saving…" means it was still in flight, and "Unsaved changes" means the ' +
+          'scheduler never fired at all.',
+      },
+    )
+    .toBe('saved');
+}
+
 /** Nothing a mouse could have done has happened on this page. */
 async function expectNoPointerEvents(page: Page) {
   const events = await page.evaluate(
@@ -195,18 +248,27 @@ test.describe('SPEC-007 — the editor is operable from the keyboard alone', () 
       // And it survives the round trip to the database, which is what makes it
       // a formatting command rather than a local decoration.
       await page.keyboard.press('ControlOrMeta+s');
-      await expect(page.getByTestId('save-indicator')).toHaveText('Saved', { timeout: 10_000 });
-      // Polled rather than read once. `toHaveText('Saved')` above can match the
-      // state the page ARRIVED in — a draft opened from a saved row reads
-      // `Saved`, and React has not necessarily committed the `Unsaved changes`
-      // render by the time the assertion first polls — so a single read can
-      // race the save it is meant to be checking. Polling the row waits for
-      // the write itself, which is what this assertion is actually about.
+      // The row read below is the assertion, so the wait in front of it must be
+      // a real one — the page arrived reading `Saved`. See `expectSaveLanded`.
+      await expectSaveLanded(page);
       await expect
         .poll(async () => (await getArticleById(articleId))?.bodyHtml ?? '', { timeout: 10_000 })
         .toContain(`<${tag}`);
     });
   }
+
+  test('the editor arrives with no save timestamp, so expectSaveLanded is not vacuous', async ({
+    page,
+  }) => {
+    // A one-line guard on the mechanism every save assertion in this file
+    // depends on. `expectSaveLanded` waits for the timestamp element to appear;
+    // if it were already present on arrival — which is what seeding `savedAt`
+    // from the server row would do, and that is a plausible future change —
+    // every one of those waits would pass instantly and stop checking anything.
+    await openEditor(page);
+    await expect(page.getByTestId('saved-at')).toHaveCount(0);
+    await expect(page.getByTestId('save-indicator')).toHaveText('Saved');
+  });
 
   test('link is reachable, applied and removed from the keyboard', async ({ page }) => {
     // Split out from the loop because a link needs an address, and the whole
@@ -236,9 +298,8 @@ test.describe('SPEC-007 — the editor is operable from the keyboard alone', () 
     await expectNoPointerEvents(page);
 
     await page.keyboard.press('ControlOrMeta+s');
-    await expect(page.getByTestId('save-indicator')).toHaveText('Saved', { timeout: 10_000 });
+    await expectSaveLanded(page);
 
-    // Polled, not read once — see the note in the toolbar-command loop above.
     await expect
       .poll(async () => (await getArticleById(articleId))?.bodyHtml ?? '', { timeout: 10_000 })
       .toContain('href="https://example.com/essay"');
@@ -322,8 +383,7 @@ test.describe('SPEC-007 — the editor is operable from the keyboard alone', () 
     await expectNoPointerEvents(page);
 
     await page.keyboard.press('ControlOrMeta+s');
-    await expect(page.getByTestId('save-indicator')).toHaveText('Saved', { timeout: 10_000 });
-    // Polled, not read once — see the note in the toolbar-command loop above.
+    await expectSaveLanded(page);
     await expect
       .poll(async () => (await getArticleById(articleId))?.bodyHtml ?? '', { timeout: 10_000 })
       .toContain('<hr />');
